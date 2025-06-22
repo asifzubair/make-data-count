@@ -15,8 +15,13 @@ SUBMISSION_FILE = "/kaggle/working/submission.csv"
 
 
 # --- Model Configuration ---
-# The name of the model from the Hugging Face Hub that we plan to use
-MODEL_NAME = 'allenai/scibert_scivocab_cased' 
+# We keep this to remember the original source of our model
+MODEL_HUB_NAME = 'allenai/scibert_scivocab_cased' 
+
+# NEW: This is the path to our offline Kaggle Model.
+# This is what our training and inference code will actually use.
+# (Make sure 'scibert-scivocab-cased-offline' matches the name you gave your Kaggle Model)
+MODEL_PATH = '/kaggle/input/scibert-scivocab-cased/pytorch/default/1/scibert_offline_model/'
 
 
 # --- Training Hyperparameters ---

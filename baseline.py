@@ -61,7 +61,7 @@ def main():
             predictions.append({
                 "article_id": article_id,
                 "dataset_id": f"https://doi.org/{found_doi}", # Format as a full URL
-                "type": "Secondary" # Assign the majority class
+                "type": "Primary" # Assign the majority class
             })
             
     print(f"Found {len(predictions)} potential DOI mentions in total.")
