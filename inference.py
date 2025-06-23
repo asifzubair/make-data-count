@@ -1,4 +1,4 @@
-# inference.py
+# inference.py (Final Corrected Version)
 
 import os
 import re
@@ -9,26 +9,20 @@ import spacy
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 
-# Import our project settings
 import config
 
 def load_model_and_tokenizer():
-    """Loads the fine-tuned model and tokenizer from the specified path."""
-    # NOTE: The path in config.py must now point to the output of our training notebook
     model_path = config.FINE_TUNED_MODEL_PATH
     print(f"Loading fine-tuned model from: {model_path}")
-    
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model directory not found at {model_path}. Did you add the training output as a data source?")
-
+        raise FileNotFoundError(f"Model directory not found at {model_path}.")
     model = AutoModelForTokenClassification.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model.to(config.DEVICE)
-    model.eval() # Set the model to evaluation mode
+    model.eval()
     return model, tokenizer
 
 def extract_text_from_xml(xml_file_path):
-    """Parses an XML file and extracts all text content."""
     try:
         tree = etree.parse(xml_file_path)
         full_text = tree.xpath("string()")
@@ -37,55 +31,49 @@ def extract_text_from_xml(xml_file_path):
         return ""
 
 def normalize_doi(text):
-    """Converts a found DOI to the standard https://doi.org/ format."""
+    text = text.strip(" .,") # Remove common trailing characters
     if text.lower().startswith("10."):
         return f"https://doi.org/{text}"
-    # Add other normalizations if needed, but this is a good start
     return text
 
-def decode_predictions(tokens, preds, tokenizer):
+def decode_predictions(original_text, offsets, preds):
     """
-    Decodes a sequence of BIO predictions back into named entity spans.
+    Decodes a sequence of BIO predictions into named entity spans.
+    This is a new, much simpler and more robust implementation.
     """
-    predictions = []
-    current_entity_tokens = []
-    current_entity_type = None
-
-    for token, pred_id in zip(tokens, preds):
+    preds = preds[:len(offsets)] # Ensure preds is not longer than offsets
+    
+    entities = []
+    # Loop through each token's prediction
+    for i, pred_id in enumerate(preds):
         label = config.ID_TO_LABEL.get(pred_id)
-
-        if label is None:
-            continue
-
-        if label.startswith("B-"):
-            # If we were already in an entity, save it before starting a new one
-            if current_entity_tokens:
-                entity_text = tokenizer.decode(tokenizer.convert_tokens_to_ids(current_entity_tokens))
-                predictions.append({"text": entity_text, "type": current_entity_type})
-            
-            current_entity_tokens = [token]
-            current_entity_type = label.split("-")[1]
-
-        elif label.startswith("I-") and current_entity_type == label.split("-")[1]:
-            # If the token is inside an entity of the same type, append it
-            current_entity_tokens.append(token)
-        else:
-            # If it's 'O' or a different entity type, and we were in an entity, save it
-            if current_entity_tokens:
-                entity_text = tokenizer.decode(tokenizer.convert_tokens_to_ids(current_entity_tokens))
-                predictions.append({"text": entity_text, "type": current_entity_type})
-            current_entity_tokens = []
-            current_entity_type = None
-            
-    # Save any lingering entity at the end of the sequence
-    if current_entity_tokens:
-        entity_text = tokenizer.decode(tokenizer.convert_tokens_to_ids(current_entity_tokens))
-        predictions.append({"text": entity_text, "type": current_entity_type})
         
-    return predictions
+        # If we see a 'B-' tag, we know a new entity starts here
+        if label.startswith("B-"):
+            entity_type = label.split("-")[1]
+            start_char = offsets[i][0]
+            end_char = offsets[i][1]
+            
+            # Look ahead to find all consecutive 'I-' tags of the same type
+            for j in range(i + 1, len(preds)):
+                next_label = config.ID_TO_LABEL.get(preds[j])
+                if next_label == f"I-{entity_type}":
+                    # Extend the end character position
+                    end_char = offsets[j][1]
+                else:
+                    # The entity has ended
+                    break
+            
+            # Slice the final text from the original sentence
+            entity_text = original_text[start_char:end_char]
+            entities.append({"text": entity_text, "type": entity_type})
+
+    return entities
+
 
 def main():
     """Main inference pipeline."""
+    print("--- RUNNING SCRIPT VERSION 5.0 (robust decoding) ---")
     print("--- Starting Inference ---")
     model, tokenizer = load_model_and_tokenizer()
     nlp = spacy.load("en_core_web_sm")
@@ -94,61 +82,49 @@ def main():
     test_files = os.listdir(config.TEST_XML_DIR)
 
     for filename in tqdm(test_files, desc="Predicting on Test Articles"):
-        if not filename.endswith('.xml'):
-            continue
-            
+        if not filename.endswith('.xml'): continue
         article_id = filename.replace('.xml', '')
         file_path = os.path.join(config.TEST_XML_DIR, filename)
         
         full_text = extract_text_from_xml(file_path)
-        if not full_text:
-            continue
+        if not full_text: continue
 
         article_entities = []
         doc = nlp(full_text)
 
-        # Process sentence by sentence to handle long documents
         for sentence in doc.sents:
+            sentence_text = sentence.text
             inputs = tokenizer(
-                sentence.text,
+                sentence_text,
                 return_tensors="pt",
                 truncation=True,
                 max_length=512,
-                padding="max_length"
+                return_offsets_mapping=True
             ).to(config.DEVICE)
             
+            offsets = inputs.pop("offset_mapping")[0].tolist()
+
             with torch.no_grad():
                 logits = model(**inputs).logits
             
             predictions = torch.argmax(logits, dim=2)
             predicted_token_class_ids = predictions[0].tolist()
-
-            tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
             
-            found_entities = decode_predictions(tokens, predicted_token_class_ids, tokenizer)
+            found_entities = decode_predictions(sentence_text, offsets, predicted_token_class_ids)
             article_entities.extend(found_entities)
 
-        # Post-process the entities found for this article
         for entity in article_entities:
-            # Normalize DOIs
             dataset_id = normalize_doi(entity['text'])
-            # The type is already capitalized correctly by our config (e.g., 'primary' -> 'Primary')
             dataset_type = entity['type'].capitalize()
-            
             all_predictions.append((article_id, dataset_id, dataset_type))
 
-    # --- Final Formatting ---
     print(f"\nFound {len(all_predictions)} total potential citations.")
-    
-    # Apply uniqueness rule: (article_id, dataset_id, type) must be unique
     unique_predictions = sorted(list(set(all_predictions)))
     print(f"Found {len(unique_predictions)} unique citations after deduplication.")
     
-    # Create submission DataFrame
     submission_df = pd.DataFrame(unique_predictions, columns=['article_id', 'dataset_id', 'type'])
     submission_df.insert(0, 'row_id', range(len(submission_df)))
     
-    # Save submission file
     submission_df.to_csv(config.SUBMISSION_FILE, index=False)
     print(f"\nSubmission file created successfully at {config.SUBMISSION_FILE}")
     print("Sample of final submission:")
