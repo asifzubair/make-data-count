@@ -1,4 +1,4 @@
-# inference.py (Final, Robust, Two-Stage Decoder)
+# inference.py (Verified Logic)
 
 import os
 import re
@@ -10,7 +10,19 @@ from tqdm import tqdm
 from collections import Counter
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 
-import config
+# This config class will be used instead of importing to make this script fully self-contained if needed
+class SimpleConfig:
+    FINE_TUNED_MODEL_PATH = '/kaggle/input/finetuned-model-v1/output/scibert-finetuned-final/'
+    TEST_XML_DIR = '/kaggle/input/make-data-count-finding-data-references/test/XML/'
+    SUBMISSION_FILE = '/kaggle/working/submission.csv'
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ID_TO_LABEL = {
+        0: 'O', 1: 'B-primary', 2: 'I-primary',
+        3: 'B-secondary', 4: 'I-secondary',
+    }
+
+config = SimpleConfig()
+
 
 def load_model_and_tokenizer():
     model_path = config.FINE_TUNED_MODEL_PATH
@@ -24,7 +36,6 @@ def load_model_and_tokenizer():
     return model, tokenizer
 
 def extract_text_from_xml(xml_file_path):
-    # ... (this function is correct, no changes needed) ...
     try:
         tree = etree.parse(xml_file_path)
         full_text = tree.xpath("string()")
@@ -32,54 +43,42 @@ def extract_text_from_xml(xml_file_path):
     except Exception:
         return ""
 
-def normalize_doi(text):
-    # ... (this function is correct, no changes needed) ...
-    text = text.strip(" .,;")
-    if 'doi.org' in text:
-        text = "https://"+text[text.find("doi.org"):]
-    elif text.lower().startswith("10."):
-        text = f"https://doi.org/{text}"
-    return text
+def normalize_text(text):
+    return text.strip(" .,;")
 
 def decode_predictions(original_text, offsets, preds):
     """
-    Decodes predictions using a robust, two-stage approach.
-    1. Find all contiguous entity boundaries (any B- or I- tag).
-    2. Determine the type of the whole entity by majority vote.
+    Decodes predictions using the robust, two-stage approach that we verified.
     """
-    labels = [config.ID_TO_LABEL.get(p, 'O') for p in preds]
+    labels = [config.ID_TO_LABEL.get(p, 'O') for p in preds[:len(offsets)]]
     
     # Step 1: Group all adjacent B- and I- tags
-    entity_groups = []
-    current_group_indices = []
+    entity_groups_indices = []
+    current_group = []
     for i, label in enumerate(labels):
         if offsets[i] == (0,0): continue
-
+        
         if label[0] in 'BI':
-            current_group_indices.append(i)
-        else: # It's 'O', so the entity (if any) has ended
-            if current_group_indices:
-                entity_groups.append(current_group_indices)
-                current_group_indices = []
-    # Add any lingering group
-    if current_group_indices:
-        entity_groups.append(current_group_indices)
+            current_group.append(i)
+        else:
+            if current_group:
+                entity_groups_indices.append(current_group)
+                current_group = []
+    if current_group:
+        entity_groups_indices.append(current_group)
 
     # Step 2: Determine type by majority vote and extract text
     final_entities = []
-    for indices in entity_groups:
-        # Get all the labels for the tokens in this group
-        group_labels = [labels[i] for i in indices]
+    for indices in entity_groups_indices:
+        if not indices: continue
         
-        # Get just the types (e.g., 'primary', 'secondary')
+        group_labels = [labels[i] for i in indices]
         group_types = [label.split('-')[1] for label in group_labels if '-' in label]
         
         if not group_types: continue
 
-        # Majority vote to determine the final type for the whole span
         final_type = Counter(group_types).most_common(1)[0][0]
         
-        # Get character spans and slice from original text
         start_char = offsets[indices[0]][0]
         end_char = offsets[indices[-1]][1]
         entity_text = original_text[start_char:end_char]
@@ -88,13 +87,11 @@ def decode_predictions(original_text, offsets, preds):
         
     return final_entities
 
-
 def main():
     """Main inference pipeline."""
-    print("--- RUNNING SCRIPT VERSION 9.0 (two-stage robust decoder) ---")
+    print("--- RUNNING FINAL VERIFIED INFERENCE SCRIPT ---")
     model, tokenizer = load_model_and_tokenizer()
     nlp = spacy.load("en_core_web_sm")
-    # ... (the rest of the main function is correct and does not need changes) ...
     all_predictions = []
     test_files = os.listdir(config.TEST_XML_DIR)
 
@@ -106,8 +103,8 @@ def main():
         full_text = extract_text_from_xml(file_path)
         if not full_text: continue
 
-        article_entities = []
         doc = nlp(full_text)
+        article_entities = []
 
         for sentence in doc.sents:
             sentence_text = sentence.text
@@ -122,16 +119,23 @@ def main():
             article_entities.extend(found_entities)
 
         for entity in article_entities:
-            dataset_id = normalize_doi(entity['text'])
+            dataset_id = normalize_text(entity['text'])
+            # DOI normalization
+            if 'doi.org' in dataset_id:
+                dataset_id = "https://"+dataset_id[dataset_id.find("doi.org"):]
+            elif dataset_id.lower().startswith("10."):
+                dataset_id = f"https://doi.org/{dataset_id}"
+            
             dataset_type = entity['type'].capitalize()
             all_predictions.append((article_id, dataset_id, dataset_type))
 
     unique_predictions = sorted(list(set(all_predictions)))
     submission_df = pd.DataFrame(unique_predictions, columns=['article_id', 'dataset_id', 'type'])
+    
     if not submission_df.empty:
         submission_df.insert(0, 'row_id', range(len(submission_df)))
     else:
-        submission_df['row_id'] = []
+        submission_df = pd.DataFrame(columns=['row_id', 'article_id', 'dataset_id', 'type'])
 
     submission_df.to_csv(config.SUBMISSION_FILE, index=False)
     print(f"\nSubmission file created successfully at {config.SUBMISSION_FILE}")
