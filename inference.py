@@ -1,4 +1,4 @@
-# inference.py (Final version with post-processing merge)
+# inference.py (Final, Robust, Two-Stage Decoder)
 
 import os
 import re
@@ -7,6 +7,7 @@ from lxml import etree
 import torch
 import spacy
 from tqdm import tqdm
+from collections import Counter
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 
 import config
@@ -23,6 +24,7 @@ def load_model_and_tokenizer():
     return model, tokenizer
 
 def extract_text_from_xml(xml_file_path):
+    # ... (this function is correct, no changes needed) ...
     try:
         tree = etree.parse(xml_file_path)
         full_text = tree.xpath("string()")
@@ -31,55 +33,68 @@ def extract_text_from_xml(xml_file_path):
         return ""
 
 def normalize_doi(text):
-    return text.strip(" .,")
+    # ... (this function is correct, no changes needed) ...
+    text = text.strip(" .,;")
+    if 'doi.org' in text:
+        text = "https://"+text[text.find("doi.org"):]
+    elif text.lower().startswith("10."):
+        text = f"https://doi.org/{text}"
+    return text
 
 def decode_predictions(original_text, offsets, preds):
-    entities = []
-    for i, pred_id in enumerate(preds):
-        label = config.ID_TO_LABEL.get(pred_id)
-        if label and label.startswith("B-"):
-            entity_type = label.split("-")[1]
-            start_char, end_char = offsets[i]
-            
-            for j in range(i + 1, len(preds)):
-                next_label = config.ID_TO_LABEL.get(preds[j])
-                if not (next_label and next_label == f"I-{entity_type}"):
-                    break
-                end_char = offsets[j][1]
-            
-            entity_text = original_text[start_char:end_char]
-            entities.append({"text": entity_text, "type": entity_type, "start": start_char, "end": end_char})
-    return entities
-
-def merge_adjacent_entities(entities):
-    """Merges adjacent or overlapping entities of the same type."""
-    if not entities:
-        return []
-
-    # Sort entities by their start position
-    entities.sort(key=lambda x: x['start'])
+    """
+    Decodes predictions using a robust, two-stage approach.
+    1. Find all contiguous entity boundaries (any B- or I- tag).
+    2. Determine the type of the whole entity by majority vote.
+    """
+    labels = [config.ID_TO_LABEL.get(p, 'O') for p in preds]
     
-    merged = []
-    current_entity = entities[0]
+    # Step 1: Group all adjacent B- and I- tags
+    entity_groups = []
+    current_group_indices = []
+    for i, label in enumerate(labels):
+        if offsets[i] == (0,0): continue
 
-    for next_entity in entities[1:]:
-        # Check if entities are adjacent (with up to 2 chars of separation) and same type
-        if next_entity['start'] <= current_entity['end'] + 2 and next_entity['type'] == current_entity['type']:
-            # Merge by extending the end position
-            current_entity['end'] = max(current_entity['end'], next_entity['end'])
-            # Update text to reflect merged span
-            current_entity['text'] = current_entity['text'] + next_entity['text'][current_entity['end'] - next_entity['start']:]
-        else:
-            merged.append(current_entity)
-            current_entity = next_entity
-            
-    merged.append(current_entity)
-    return merged
+        if label[0] in 'BI':
+            current_group_indices.append(i)
+        else: # It's 'O', so the entity (if any) has ended
+            if current_group_indices:
+                entity_groups.append(current_group_indices)
+                current_group_indices = []
+    # Add any lingering group
+    if current_group_indices:
+        entity_groups.append(current_group_indices)
+
+    # Step 2: Determine type by majority vote and extract text
+    final_entities = []
+    for indices in entity_groups:
+        # Get all the labels for the tokens in this group
+        group_labels = [labels[i] for i in indices]
+        
+        # Get just the types (e.g., 'primary', 'secondary')
+        group_types = [label.split('-')[1] for label in group_labels if '-' in label]
+        
+        if not group_types: continue
+
+        # Majority vote to determine the final type for the whole span
+        final_type = Counter(group_types).most_common(1)[0][0]
+        
+        # Get character spans and slice from original text
+        start_char = offsets[indices[0]][0]
+        end_char = offsets[indices[-1]][1]
+        entity_text = original_text[start_char:end_char]
+        
+        final_entities.append({"text": entity_text, "type": final_type})
+        
+    return final_entities
+
 
 def main():
-    print("--- RUNNING SCRIPT VERSION 6.0 (with post-processing merge) ---")
+    """Main inference pipeline."""
+    print("--- RUNNING SCRIPT VERSION 9.0 (two-stage robust decoder) ---")
     model, tokenizer = load_model_and_tokenizer()
     nlp = spacy.load("en_core_web_sm")
+    # ... (the rest of the main function is correct and does not need changes) ...
     all_predictions = []
     test_files = os.listdir(config.TEST_XML_DIR)
 
@@ -87,11 +102,12 @@ def main():
         if not filename.endswith('.xml'): continue
         article_id = filename.replace('.xml', '')
         file_path = os.path.join(config.TEST_XML_DIR, filename)
+        
         full_text = extract_text_from_xml(file_path)
         if not full_text: continue
 
-        doc = nlp(full_text)
         article_entities = []
+        doc = nlp(full_text)
 
         for sentence in doc.sents:
             sentence_text = sentence.text
@@ -102,39 +118,26 @@ def main():
                 logits = model(**inputs).logits
             
             predicted_ids = torch.argmax(logits, dim=2)[0].tolist()
-            
-            # Use character offsets relative to the whole document for merging
-            sent_start_char = sentence.start_char
-            
             found_entities = decode_predictions(sentence_text, offsets, predicted_ids)
-            for entity in found_entities:
-                # Adjust start/end to be relative to the full document text
-                entity['start'] += sent_start_char
-                entity['end'] += sent_start_char
-                article_entities.append(entity)
+            article_entities.extend(found_entities)
 
-        # Post-processing step to merge fragments for the whole article
-        merged_article_entities = merge_adjacent_entities(article_entities)
-
-        for entity in merged_article_entities:
-            # Re-slice the text from the full document now that we have the final merged span
-            dataset_id = normalize_doi(full_text[entity['start']:entity['end']])
-            # Special check for DOIs
-            if 'doi.org' in dataset_id:
-                 dataset_id = "https://"+dataset_id[dataset_id.find("doi.org"):]
-
+        for entity in article_entities:
+            dataset_id = normalize_doi(entity['text'])
             dataset_type = entity['type'].capitalize()
             all_predictions.append((article_id, dataset_id, dataset_type))
 
     unique_predictions = sorted(list(set(all_predictions)))
     submission_df = pd.DataFrame(unique_predictions, columns=['article_id', 'dataset_id', 'type'])
-    submission_df.insert(0, 'row_id', range(len(submission_df)))
-    
+    if not submission_df.empty:
+        submission_df.insert(0, 'row_id', range(len(submission_df)))
+    else:
+        submission_df['row_id'] = []
+
     submission_df.to_csv(config.SUBMISSION_FILE, index=False)
     print(f"\nSubmission file created successfully at {config.SUBMISSION_FILE}")
     print("Sample of final submission:")
     print(submission_df.head())
 
+
 if __name__ == "__main__":
     main()
-    
