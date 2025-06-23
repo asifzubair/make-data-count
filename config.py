@@ -13,7 +13,6 @@ TEST_XML_DIR = f"{DATA_ROOT}test/XML/"
 OUTPUT_DIR = "/kaggle/working/output/"
 SUBMISSION_FILE = "/kaggle/working/submission.csv"
 
-
 # --- Model Configuration ---
 # We keep this to remember the original source of our model
 MODEL_HUB_NAME = 'allenai/scibert_scivocab_cased' 
@@ -22,6 +21,10 @@ MODEL_HUB_NAME = 'allenai/scibert_scivocab_cased'
 # This is what our training and inference code will actually use.
 # (Make sure 'scibert-scivocab-cased-offline' matches the name you gave your Kaggle Model)
 MODEL_PATH = '/kaggle/input/scibert-scivocab-cased/pytorch/default/1/scibert_offline_model/'
+
+# NEW: Path to our final, fine-tuned model for inference
+# (Make sure 'finetuned-model-v1' matches the name of your input folder)
+FINE_TUNED_MODEL_PATH = '/kaggle/input/finetuned-model-v1/output/scibert-finetuned-final/'
 
 
 # --- Training Hyperparameters ---
