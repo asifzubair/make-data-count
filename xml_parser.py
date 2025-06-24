@@ -3,6 +3,10 @@ from bs4 import BeautifulSoup
 import os
 from pprint import pprint
 from tqdm import tqdm
+import logging
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- The XMLParser Class ---
 # This class encapsulates all parsing logic for a single XML file.
@@ -15,20 +19,54 @@ class XMLParser:
     def __init__(self, xml_path: str):
         """
         Initializes the parser by reading and parsing the XML file with BeautifulSoup.
+        Tries 'lxml-xml' first, then falls back to 'html.parser' if 'lxml-xml' fails.
         """
         self.xml_path = xml_path
         self.soup = None
         self._bib_map = None # Use for caching the parsed bibliography
-        
+        self.parser_used = None
+        self.bibliography_format_used = None # Stores which strategy successfully parsed the bib
+
         if not os.path.exists(xml_path):
+            logging.warning(f"File not found: {xml_path}")
             return
 
         try:
             with open(xml_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            # Use the robust lxml-xml parser with BeautifulSoup
-            self.soup = BeautifulSoup(content, 'lxml-xml')
-        except Exception:
+
+            # Attempt to parse with 'lxml-xml'
+            try:
+                self.soup = BeautifulSoup(content, 'lxml-xml')
+                if self.soup and self.soup.find(): # Check if soup is not empty and has some content
+                    self.parser_used = 'lxml-xml'
+                    logging.info(f"Successfully parsed {xml_path} with lxml-xml")
+                else:
+                    logging.warning(f"lxml-xml produced empty soup for {xml_path}. Trying html.parser.")
+                    self.soup = None # Ensure soup is None if parsing was not truly successful
+            except Exception as e_lxml:
+                logging.warning(f"Failed to parse {xml_path} with lxml-xml ({e_lxml}). Trying html.parser.")
+                self.soup = None
+
+            # If 'lxml-xml' failed or produced empty soup, try 'html.parser'
+            if self.soup is None:
+                try:
+                    self.soup = BeautifulSoup(content, 'html.parser')
+                    if self.soup and self.soup.find(): # Check if soup is not empty
+                        self.parser_used = 'html.parser'
+                        logging.info(f"Successfully parsed {xml_path} with html.parser")
+                    else:
+                        logging.warning(f"html.parser also produced empty soup for {xml_path}.")
+                        self.soup = None # Explicitly set to None
+                except Exception as e_html:
+                    logging.error(f"Failed to parse {xml_path} with html.parser as well ({e_html}).")
+                    self.soup = None
+
+            if self.soup is None:
+                logging.error(f"Could not parse XML file: {xml_path} with any available parser.")
+
+        except Exception as e_file:
+            logging.error(f"Error reading file {xml_path}: {e_file}")
             self.soup = None
 
     def _parse_bib_jats(self) -> dict:
@@ -40,20 +78,42 @@ class XMLParser:
         
         references = ref_list.find_all('ref')
         for ref in references:
+            key = None
+            # Try to get key from <label> element first
             label_element = ref.find('label')
             if label_element and label_element.text:
-                key = label_element.text.strip('.')
+                key = label_element.text.strip().strip('.')
+
+            # If no <label>, try to get key from 'id' attribute of the <ref> tag
+            if not key:
+                ref_id = ref.get('id')
+                if ref_id:
+                    key = ref_id.strip()
+
+            if key:
+                # Try 'mixed-citation' first
                 citation_element = ref.find('mixed-citation')
+                # If not found, try 'element-citation'
+                if not citation_element:
+                    citation_element = ref.find('element-citation')
+
                 if citation_element:
                     value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
                     bibliography_map[key] = value
+                # Optional: Add a log if a key was found but no citation element
+                # else:
+                #    logging.debug(f"Found key '{key}' but no citation element in {self.xml_path}")
+            # Optional: Add a log if no key could be determined for a reference
+            # else:
+            #    logging.debug(f"Could not determine key for a <ref> tag in {self.xml_path}")
         return bibliography_map
 
     def _parse_bib_tei(self) -> dict:
         """Strategy 2: Attempts to parse the bibliography using the TEI schema."""
         if not self.soup: return {}
         bibliography_map = {}
-        bib_list = self.soup.find(lambda tag: tag.name.lower() == 'listbibl')
+        # Ensure tag has a 'name' attribute before calling lower()
+        bib_list = self.soup.find(lambda tag: hasattr(tag, 'name') and tag.name and tag.name.lower() == 'listbibl')
         if not bib_list: return {}
         
         references = bib_list.find_all('biblstruct')
@@ -72,23 +132,190 @@ class XMLParser:
         if not self.soup:
             return {}
         if self._bib_map is not None:
+            # If map is already cached, format_used should also be cached implicitly (or we could re-set it)
+            # For simplicity, we assume if _bib_map is set, bibliography_format_used was set correctly before.
             return self._bib_map
+
+        self.bibliography_format_used = None # Reset / ensure it's fresh for this parse attempt
 
         # Try JATS strategy first
         bib_map = self._parse_bib_jats()
         if bib_map:
             self._bib_map = bib_map
+            self.bibliography_format_used = "jats"
             return self._bib_map
         
         # Fallback to TEI strategy
         bib_map = self._parse_bib_tei()
         if bib_map:
             self._bib_map = bib_map
+            self.bibliography_format_used = "tei"
             return self._bib_map
         
+        # Fallback to Wiley strategy
+        bib_map = self._parse_bib_wiley()
+        if bib_map:
+            self._bib_map = bib_map
+            self.bibliography_format_used = "wiley"
+            return self._bib_map
+
+        # Fallback to BioC strategy
+        bib_map = self._parse_bib_bioc()
+        if bib_map:
+            self._bib_map = bib_map
+            self.bibliography_format_used = "bioc"
+            return self._bib_map
+
         self._bib_map = {}
         return self._bib_map
-    
+
+    def _parse_bib_wiley(self) -> dict:
+        """Strategy 3: Attempts to parse the bibliography using a Wiley XML schema."""
+        if not self.soup: return {}
+        bibliography_map = {}
+
+        # Wiley references are often in <bib> tags with an xml:id
+        # These <bib> tags might be under a general content tag, or a specific "references" section
+        # For now, let's find all <bib> tags directly.
+        # We might need to make this more specific if it picks up unrelated <bib> tags.
+        references = self.soup.find_all('bib')
+
+        if not references:
+            # Sometimes Wiley has a <ref-list> like JATS but with <ref> containing <citation-alternatives> and then the <citation>
+            # This is a bit of a hybrid, let's check for a simple version of this too if direct <bib> fails.
+            ref_list_tag = self.soup.find('ref-list') # Wiley might use 'ref-list'
+            if ref_list_tag:
+                references = ref_list_tag.find_all('ref') # and 'ref' like JATS
+
+        for ref_tag in references: # This could be a <bib> or <ref> tag depending on above
+            key = ref_tag.get('xml:id') or ref_tag.get('id') # Use xml:id first, then id
+
+            if key:
+                citation_element = ref_tag.find('citation') # Wiley uses <citation> directly inside <bib> or <ref>
+
+                # Handle cases like <citation-alternatives><citation>...</citation></citation-alternatives>
+                if not citation_element:
+                    citation_alt_element = ref_tag.find('citation-alternatives')
+                    if citation_alt_element:
+                        citation_element = citation_alt_element.find('citation')
+
+                if citation_element:
+                    # Extract text carefully to reconstruct a readable reference string
+                    # This might need more refinement based on Wiley's specific sub-tags within <citation>
+                    value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
+                    bibliography_map[key] = value
+
+        if bibliography_map:
+            logging.info(f"Parsed bibliography using Wiley strategy for {self.xml_path}")
+        return bibliography_map
+
+    def _parse_bib_bioc(self) -> dict:
+        """Strategy 4: Attempts to parse bibliography from BioC XML format."""
+        if not self.soup: return {}
+        bibliography_map = {}
+
+        passages = self.soup.find_all('passage')
+        ref_counter = 0
+
+        for passage in passages:
+            is_reference_passage = False
+            infons = passage.find_all('infon')
+            passage_infons = {}
+            for infon in infons:
+                key = infon.get('key')
+                if key:
+                    passage_infons[key] = infon.text.strip()
+                    if key == 'section_type' and infon.text.strip().upper() == 'REF':
+                        is_reference_passage = True
+
+            if is_reference_passage:
+                # Heuristic: try to ensure it's a "real" reference, not just a link like "See ref [5]"
+                # A simple check: must have some text content OR a 'source' infon.
+                passage_text_content = passage.find('text')
+                text_content_str = ' '.join(passage_text_content.get_text(separator=' ', strip=True).split()) if passage_text_content else ""
+
+                source = passage_infons.get('source', '')
+
+                # If it only has linking text and no source, skip (this is a basic heuristic)
+                if not source and text_content_str.lower().startswith("see ref") and len(passage_infons) < 3 : # arbitrary small number
+                    continue
+                if not source and not text_content_str and len(passage_infons) < 3: # likely not a real ref if no source, no text, few infons
+                    continue
+
+
+                ref_parts = []
+                # Attempt to reconstruct a somewhat ordered reference string
+                # This is highly heuristic and may need refinement based on common BioC structures
+
+                # Authors (if available under a known key, e.g. 'authors_str' or similar)
+                authors = passage_infons.get('authors_str') # Assuming a key 'authors_str' might exist
+                if authors: ref_parts.append(authors)
+
+                title = passage_infons.get('title', '') # Assuming a 'title' key for article/chapter title
+                if title: ref_parts.append(title)
+
+                if source: ref_parts.append(f"Source: {source}")
+
+                year = passage_infons.get('year')
+                if year: ref_parts.append(f"Year: {year}")
+
+                volume = passage_infons.get('volume')
+                if volume: ref_parts.append(f"Vol: {volume}")
+
+                issue = passage_infons.get('issue')
+                if issue: ref_parts.append(f"Issue: {issue}")
+
+                fpage = passage_infons.get('fpage')
+                lpage = passage_infons.get('lpage')
+                if fpage and lpage:
+                    ref_parts.append(f"pp. {fpage}-{lpage}")
+                elif fpage:
+                    ref_parts.append(f"p. {fpage}")
+
+                # Add any other direct text from the passage not captured in specific infons
+                if text_content_str and not any(text_content_str in part for part in ref_parts):
+                    # Avoid duplicating text if it was already part of a specific infon (e.g. if title was in <text>)
+                    # This check is very basic.
+                    is_already_present = False
+                    for key_info, val_info in passage_infons.items():
+                        if val_info == text_content_str:
+                            is_already_present = True
+                            break
+                    if not is_already_present:
+                         ref_parts.append(text_content_str)
+
+
+                if not ref_parts and not source and not title and not year : # if still nothing substantial, skip
+                    continue
+
+                ref_string = ". ".join(filter(None, ref_parts))
+                if not ref_string.strip(): # Don't add empty references
+                    continue
+
+                # CHECK: If the constructed string is JUST a common bibliography title, and lacks other data, skip it.
+                common_bib_titles_to_skip = ["references", "bibliography", "literature cited", "reference list"]
+                # Check if the ref_string, when stripped and lowercased, is one of these titles
+                # AND if there isn't much other structured data (like source, year, fpage from infons)
+                # to suggest it's a legitimate reference that happens to have such a title.
+                if ref_string.strip().lower() in common_bib_titles_to_skip:
+                    has_other_data = passage_infons.get('source') or \
+                                     passage_infons.get('year') or \
+                                     passage_infons.get('fpage') or \
+                                     passage_infons.get('authors_str') # Check authors too
+                    # If it's a common title AND it lacks other distinguishing data, skip.
+                    if not has_other_data:
+                        logging.info(f"Skipping likely section title in BioC for {self.xml_path}: '{ref_string}'")
+                        continue
+
+                # DOI will be included if it's part of the text collected in ref_parts.
+                # No separate DOI field for consistency with other parsers for now.
+                ref_counter += 1
+                bibliography_map[str(ref_counter)] = ref_string
+
+        if bibliography_map:
+            logging.info(f"Parsed bibliography using BioC strategy for {self.xml_path} (found {ref_counter} refs)")
+        return bibliography_map
+
     def get_full_text(self) -> str:
         """Extracts all human-readable text from the parsed document."""
         if not self.soup:
