@@ -3,6 +3,10 @@ from bs4 import BeautifulSoup
 import os
 from pprint import pprint
 from tqdm import tqdm
+import logging
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- The XMLParser Class ---
 # This class encapsulates all parsing logic for a single XML file.
@@ -15,20 +19,53 @@ class XMLParser:
     def __init__(self, xml_path: str):
         """
         Initializes the parser by reading and parsing the XML file with BeautifulSoup.
+        Tries 'lxml-xml' first, then falls back to 'html.parser' if 'lxml-xml' fails.
         """
         self.xml_path = xml_path
         self.soup = None
         self._bib_map = None # Use for caching the parsed bibliography
-        
+        self.parser_used = None
+
         if not os.path.exists(xml_path):
+            logging.warning(f"File not found: {xml_path}")
             return
 
         try:
             with open(xml_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            # Use the robust lxml-xml parser with BeautifulSoup
-            self.soup = BeautifulSoup(content, 'lxml-xml')
-        except Exception:
+
+            # Attempt to parse with 'lxml-xml'
+            try:
+                self.soup = BeautifulSoup(content, 'lxml-xml')
+                if self.soup and self.soup.find(): # Check if soup is not empty and has some content
+                    self.parser_used = 'lxml-xml'
+                    logging.info(f"Successfully parsed {xml_path} with lxml-xml")
+                else:
+                    logging.warning(f"lxml-xml produced empty soup for {xml_path}. Trying html.parser.")
+                    self.soup = None # Ensure soup is None if parsing was not truly successful
+            except Exception as e_lxml:
+                logging.warning(f"Failed to parse {xml_path} with lxml-xml ({e_lxml}). Trying html.parser.")
+                self.soup = None
+
+            # If 'lxml-xml' failed or produced empty soup, try 'html.parser'
+            if self.soup is None:
+                try:
+                    self.soup = BeautifulSoup(content, 'html.parser')
+                    if self.soup and self.soup.find(): # Check if soup is not empty
+                        self.parser_used = 'html.parser'
+                        logging.info(f"Successfully parsed {xml_path} with html.parser")
+                    else:
+                        logging.warning(f"html.parser also produced empty soup for {xml_path}.")
+                        self.soup = None # Explicitly set to None
+                except Exception as e_html:
+                    logging.error(f"Failed to parse {xml_path} with html.parser as well ({e_html}).")
+                    self.soup = None
+
+            if self.soup is None:
+                logging.error(f"Could not parse XML file: {xml_path} with any available parser.")
+
+        except Exception as e_file:
+            logging.error(f"Error reading file {xml_path}: {e_file}")
             self.soup = None
 
     def _parse_bib_jats(self) -> dict:
@@ -43,7 +80,12 @@ class XMLParser:
             label_element = ref.find('label')
             if label_element and label_element.text:
                 key = label_element.text.strip('.')
+                # Try 'mixed-citation' first
                 citation_element = ref.find('mixed-citation')
+                # If not found, try 'element-citation'
+                if not citation_element:
+                    citation_element = ref.find('element-citation')
+
                 if citation_element:
                     value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
                     bibliography_map[key] = value
