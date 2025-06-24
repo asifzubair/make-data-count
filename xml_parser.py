@@ -193,7 +193,97 @@ class XMLParser:
         if bibliography_map:
             logging.info(f"Parsed bibliography using Wiley strategy for {self.xml_path}")
         return bibliography_map
-    
+
+    def _parse_bib_bioc(self) -> dict:
+        """Strategy 4: Attempts to parse bibliography from BioC XML format."""
+        if not self.soup: return {}
+        bibliography_map = {}
+
+        passages = self.soup.find_all('passage')
+        ref_counter = 0
+
+        for passage in passages:
+            is_reference_passage = False
+            infons = passage.find_all('infon')
+            passage_infons = {}
+            for infon in infons:
+                key = infon.get('key')
+                if key:
+                    passage_infons[key] = infon.text.strip()
+                    if key == 'section_type' and infon.text.strip().upper() == 'REF':
+                        is_reference_passage = True
+
+            if is_reference_passage:
+                # Heuristic: try to ensure it's a "real" reference, not just a link like "See ref [5]"
+                # A simple check: must have some text content OR a 'source' infon.
+                passage_text_content = passage.find('text')
+                text_content_str = ' '.join(passage_text_content.get_text(separator=' ', strip=True).split()) if passage_text_content else ""
+
+                source = passage_infons.get('source', '')
+
+                # If it only has linking text and no source, skip (this is a basic heuristic)
+                if not source and text_content_str.lower().startswith("see ref") and len(passage_infons) < 3 : # arbitrary small number
+                    continue
+                if not source and not text_content_str and len(passage_infons) < 3: # likely not a real ref if no source, no text, few infons
+                    continue
+
+
+                ref_parts = []
+                # Attempt to reconstruct a somewhat ordered reference string
+                # This is highly heuristic and may need refinement based on common BioC structures
+
+                # Authors (if available under a known key, e.g. 'authors_str' or similar)
+                authors = passage_infons.get('authors_str') # Assuming a key 'authors_str' might exist
+                if authors: ref_parts.append(authors)
+
+                title = passage_infons.get('title', '') # Assuming a 'title' key for article/chapter title
+                if title: ref_parts.append(title)
+
+                if source: ref_parts.append(f"Source: {source}")
+
+                year = passage_infons.get('year')
+                if year: ref_parts.append(f"Year: {year}")
+
+                volume = passage_infons.get('volume')
+                if volume: ref_parts.append(f"Vol: {volume}")
+
+                issue = passage_infons.get('issue')
+                if issue: ref_parts.append(f"Issue: {issue}")
+
+                fpage = passage_infons.get('fpage')
+                lpage = passage_infons.get('lpage')
+                if fpage and lpage:
+                    ref_parts.append(f"pp. {fpage}-{lpage}")
+                elif fpage:
+                    ref_parts.append(f"p. {fpage}")
+
+                # Add any other direct text from the passage not captured in specific infons
+                if text_content_str and not any(text_content_str in part for part in ref_parts):
+                    # Avoid duplicating text if it was already part of a specific infon (e.g. if title was in <text>)
+                    # This check is very basic.
+                    is_already_present = False
+                    for key_info, val_info in passage_infons.items():
+                        if val_info == text_content_str:
+                            is_already_present = True
+                            break
+                    if not is_already_present:
+                         ref_parts.append(text_content_str)
+
+
+                if not ref_parts and not source and not title and not year : # if still nothing substantial, skip
+                    continue
+
+                ref_string = ". ".join(filter(None, ref_parts))
+                if not ref_string.strip(): # Don't add empty references
+                    continue
+
+                ref_counter += 1
+                bibliography_map[str(ref_counter)] = ref_string
+
+        if bibliography_map:
+            logging.info(f"Parsed bibliography using BioC strategy for {self.xml_path} (found {ref_counter} refs)")
+        return bibliography_map
+
     def get_full_text(self) -> str:
         """Extracts all human-readable text from the parsed document."""
         if not self.soup:
