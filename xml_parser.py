@@ -95,7 +95,8 @@ class XMLParser:
         """Strategy 2: Attempts to parse the bibliography using the TEI schema."""
         if not self.soup: return {}
         bibliography_map = {}
-        bib_list = self.soup.find(lambda tag: tag.name.lower() == 'listbibl')
+        # Ensure tag has a 'name' attribute before calling lower()
+        bib_list = self.soup.find(lambda tag: hasattr(tag, 'name') and tag.name and tag.name.lower() == 'listbibl')
         if not bib_list: return {}
         
         references = bib_list.find_all('biblstruct')
