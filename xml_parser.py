@@ -283,8 +283,33 @@ class XMLParser:
                 if not ref_string.strip(): # Don't add empty references
                     continue
 
+                # CHECK: If the constructed string is JUST a common bibliography title, and lacks other data, skip it.
+                common_bib_titles_to_skip = ["references", "bibliography", "literature cited", "reference list"]
+                # Check if the ref_string, when stripped and lowercased, is one of these titles
+                # AND if there isn't much other structured data (like source, year, fpage from infons)
+                # to suggest it's a legitimate reference that happens to have such a title.
+                if ref_string.strip().lower() in common_bib_titles_to_skip:
+                    has_other_data = passage_infons.get('source') or \
+                                     passage_infons.get('year') or \
+                                     passage_infons.get('fpage') or \
+                                     passage_infons.get('authors_str') # Check authors too
+                    # If it's a common title AND it lacks other distinguishing data, skip.
+                    if not has_other_data:
+                        logging.info(f"Skipping likely section title in BioC for {self.xml_path}: '{ref_string}'")
+                        continue
+
+                # Look for DOI specifically
+                doi_value = None
+                for key_inf, val_inf in passage_infons.items():
+                    if key_inf.lower() in ['doi', 'pub-id_doi']:
+                        doi_value = val_inf
+                        break # Take the first one found
+
                 ref_counter += 1
-                bibliography_map[str(ref_counter)] = ref_string
+                bibliography_map[str(ref_counter)] = {
+                    "text": ref_string,
+                    "doi": doi_value
+                }
 
         if bibliography_map:
             logging.info(f"Parsed bibliography using BioC strategy for {self.xml_path} (found {ref_counter} refs)")
