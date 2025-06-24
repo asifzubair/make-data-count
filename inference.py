@@ -1,4 +1,4 @@
-# inference.py (Verified Logic)
+# inference.py (Version 1.1 - Batched for Speed)
 
 import os
 import re
@@ -10,7 +10,7 @@ from tqdm import tqdm
 from collections import Counter
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 
-# This config class will be used instead of importing to make this script fully self-contained if needed
+# Using a self-contained config
 class SimpleConfig:
     FINE_TUNED_MODEL_PATH = '/kaggle/input/finetuned-model-v1/output/scibert-finetuned-final/'
     TEST_XML_DIR = '/kaggle/input/make-data-count-finding-data-references/test/XML/'
@@ -25,6 +25,7 @@ config = SimpleConfig()
 
 
 def load_model_and_tokenizer():
+    # ... (This function is correct, no changes needed) ...
     model_path = config.FINE_TUNED_MODEL_PATH
     print(f"Loading fine-tuned model from: {model_path}")
     if not os.path.exists(model_path):
@@ -36,6 +37,7 @@ def load_model_and_tokenizer():
     return model, tokenizer
 
 def extract_text_from_xml(xml_file_path):
+    # ... (This function is correct, no changes needed) ...
     try:
         tree = etree.parse(xml_file_path)
         full_text = tree.xpath("string()")
@@ -44,56 +46,43 @@ def extract_text_from_xml(xml_file_path):
         return ""
 
 def normalize_text(text):
+    # ... (This function is correct, no changes needed) ...
     return text.strip(" .,;")
 
 def decode_predictions(original_text, offsets, preds):
-    """
-    Decodes predictions using the robust, two-stage approach that we verified.
-    """
+    # ... (This function is correct, no changes needed) ...
     labels = [config.ID_TO_LABEL.get(p, 'O') for p in preds[:len(offsets)]]
-    
-    # Step 1: Group all adjacent B- and I- tags
-    entity_groups_indices = []
-    current_group = []
+    entity_groups_indices, current_group = [], []
     for i, label in enumerate(labels):
         if offsets[i] == (0,0): continue
-        
-        if label[0] in 'BI':
-            current_group.append(i)
+        if label[0] in 'BI': current_group.append(i)
         else:
-            if current_group:
-                entity_groups_indices.append(current_group)
-                current_group = []
-    if current_group:
-        entity_groups_indices.append(current_group)
-
-    # Step 2: Determine type by majority vote and extract text
+            if current_group: entity_groups_indices.append(current_group)
+            current_group = []
+    if current_group: entity_groups_indices.append(current_group)
     final_entities = []
     for indices in entity_groups_indices:
         if not indices: continue
-        
         group_labels = [labels[i] for i in indices]
         group_types = [label.split('-')[1] for label in group_labels if '-' in label]
-        
         if not group_types: continue
-
         final_type = Counter(group_types).most_common(1)[0][0]
-        
-        start_char = offsets[indices[0]][0]
-        end_char = offsets[indices[-1]][1]
+        start_char, end_char = offsets[indices[0]][0], offsets[indices[-1]][1]
         entity_text = original_text[start_char:end_char]
-        
         final_entities.append({"text": entity_text, "type": final_type})
-        
     return final_entities
 
+
 def main():
-    """Main inference pipeline."""
-    print("--- RUNNING FINAL VERIFIED INFERENCE SCRIPT ---")
+    """Main inference pipeline with BATCHING for speed."""
+    print("--- RUNNING BATCHED INFERENCE SCRIPT (V1.1) ---")
     model, tokenizer = load_model_and_tokenizer()
     nlp = spacy.load("en_core_web_sm")
     all_predictions = []
     test_files = os.listdir(config.TEST_XML_DIR)
+    
+    # Define a batch size for inference
+    INFERENCE_BATCH_SIZE = 16
 
     for filename in tqdm(test_files, desc="Predicting on Test Articles"):
         if not filename.endswith('.xml'): continue
@@ -104,23 +93,41 @@ def main():
         if not full_text: continue
 
         doc = nlp(full_text)
+        sentences = [s.text for s in doc.sents if len(s.text.strip()) > 5]
         article_entities = []
 
-        for sentence in doc.sents:
-            sentence_text = sentence.text
-            inputs = tokenizer(sentence_text, return_tensors="pt", truncation=True, max_length=512, return_offsets_mapping=True).to(config.DEVICE)
-            offsets = inputs.pop("offset_mapping")[0].tolist()
+        # --- THE BATCHING LOGIC ---
+        for i in range(0, len(sentences), INFERENCE_BATCH_SIZE):
+            batch_sentences = sentences[i : i + INFERENCE_BATCH_SIZE]
+            
+            inputs = tokenizer(
+                batch_sentences,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512, # The tokenizer pads all sentences in the batch to the same length
+                padding="max_length",
+                return_offsets_mapping=True
+            ).to(config.DEVICE)
+            
+            offsets_batch = inputs.pop("offset_mapping")
 
             with torch.no_grad():
                 logits = model(**inputs).logits
             
-            predicted_ids = torch.argmax(logits, dim=2)[0].tolist()
-            found_entities = decode_predictions(sentence_text, offsets, predicted_ids)
-            article_entities.extend(found_entities)
+            predictions_batch = torch.argmax(logits, dim=2)
+
+            # Now, decode each sentence in the batch
+            for j in range(len(batch_sentences)):
+                sentence_text = batch_sentences[j]
+                sentence_offsets = offsets_batch[j].tolist()
+                sentence_preds = predictions_batch[j].tolist()
+                
+                found_entities = decode_predictions(sentence_text, sentence_offsets, sentence_preds)
+                article_entities.extend(found_entities)
+        # --- END OF BATCHING LOGIC ---
 
         for entity in article_entities:
             dataset_id = normalize_text(entity['text'])
-            # DOI normalization
             if 'doi.org' in dataset_id:
                 dataset_id = "https://"+dataset_id[dataset_id.find("doi.org"):]
             elif dataset_id.lower().startswith("10."):
@@ -141,7 +148,6 @@ def main():
     print(f"\nSubmission file created successfully at {config.SUBMISSION_FILE}")
     print("Sample of final submission:")
     print(submission_df.head())
-
 
 if __name__ == "__main__":
     main()
