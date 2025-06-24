@@ -25,6 +25,7 @@ class XMLParser:
         self.soup = None
         self._bib_map = None # Use for caching the parsed bibliography
         self.parser_used = None
+        self.bibliography_format_used = None # Stores which strategy successfully parsed the bib
 
         if not os.path.exists(xml_path):
             logging.warning(f"File not found: {xml_path}")
@@ -131,30 +132,38 @@ class XMLParser:
         if not self.soup:
             return {}
         if self._bib_map is not None:
+            # If map is already cached, format_used should also be cached implicitly (or we could re-set it)
+            # For simplicity, we assume if _bib_map is set, bibliography_format_used was set correctly before.
             return self._bib_map
+
+        self.bibliography_format_used = None # Reset / ensure it's fresh for this parse attempt
 
         # Try JATS strategy first
         bib_map = self._parse_bib_jats()
         if bib_map:
             self._bib_map = bib_map
+            self.bibliography_format_used = "jats"
             return self._bib_map
         
         # Fallback to TEI strategy
         bib_map = self._parse_bib_tei()
         if bib_map:
             self._bib_map = bib_map
+            self.bibliography_format_used = "tei"
             return self._bib_map
         
         # Fallback to Wiley strategy
         bib_map = self._parse_bib_wiley()
         if bib_map:
             self._bib_map = bib_map
+            self.bibliography_format_used = "wiley"
             return self._bib_map
 
         # Fallback to BioC strategy
         bib_map = self._parse_bib_bioc()
         if bib_map:
             self._bib_map = bib_map
+            self.bibliography_format_used = "bioc"
             return self._bib_map
 
         self._bib_map = {}
