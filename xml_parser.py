@@ -77,9 +77,19 @@ class XMLParser:
         
         references = ref_list.find_all('ref')
         for ref in references:
+            key = None
+            # Try to get key from <label> element first
             label_element = ref.find('label')
             if label_element and label_element.text:
-                key = label_element.text.strip('.')
+                key = label_element.text.strip().strip('.')
+
+            # If no <label>, try to get key from 'id' attribute of the <ref> tag
+            if not key:
+                ref_id = ref.get('id')
+                if ref_id:
+                    key = ref_id.strip()
+
+            if key:
                 # Try 'mixed-citation' first
                 citation_element = ref.find('mixed-citation')
                 # If not found, try 'element-citation'
@@ -89,6 +99,12 @@ class XMLParser:
                 if citation_element:
                     value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
                     bibliography_map[key] = value
+                # Optional: Add a log if a key was found but no citation element
+                # else:
+                #    logging.debug(f"Found key '{key}' but no citation element in {self.xml_path}")
+            # Optional: Add a log if no key could be determined for a reference
+            # else:
+            #    logging.debug(f"Could not determine key for a <ref> tag in {self.xml_path}")
         return bibliography_map
 
     def _parse_bib_tei(self) -> dict:
