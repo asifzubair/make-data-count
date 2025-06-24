@@ -145,8 +145,54 @@ class XMLParser:
             self._bib_map = bib_map
             return self._bib_map
         
+        # Fallback to Wiley strategy
+        bib_map = self._parse_bib_wiley()
+        if bib_map:
+            self._bib_map = bib_map
+            return self._bib_map
+
         self._bib_map = {}
         return self._bib_map
+
+    def _parse_bib_wiley(self) -> dict:
+        """Strategy 3: Attempts to parse the bibliography using a Wiley XML schema."""
+        if not self.soup: return {}
+        bibliography_map = {}
+
+        # Wiley references are often in <bib> tags with an xml:id
+        # These <bib> tags might be under a general content tag, or a specific "references" section
+        # For now, let's find all <bib> tags directly.
+        # We might need to make this more specific if it picks up unrelated <bib> tags.
+        references = self.soup.find_all('bib')
+
+        if not references:
+            # Sometimes Wiley has a <ref-list> like JATS but with <ref> containing <citation-alternatives> and then the <citation>
+            # This is a bit of a hybrid, let's check for a simple version of this too if direct <bib> fails.
+            ref_list_tag = self.soup.find('ref-list') # Wiley might use 'ref-list'
+            if ref_list_tag:
+                references = ref_list_tag.find_all('ref') # and 'ref' like JATS
+
+        for ref_tag in references: # This could be a <bib> or <ref> tag depending on above
+            key = ref_tag.get('xml:id') or ref_tag.get('id') # Use xml:id first, then id
+
+            if key:
+                citation_element = ref_tag.find('citation') # Wiley uses <citation> directly inside <bib> or <ref>
+
+                # Handle cases like <citation-alternatives><citation>...</citation></citation-alternatives>
+                if not citation_element:
+                    citation_alt_element = ref_tag.find('citation-alternatives')
+                    if citation_alt_element:
+                        citation_element = citation_alt_element.find('citation')
+
+                if citation_element:
+                    # Extract text carefully to reconstruct a readable reference string
+                    # This might need more refinement based on Wiley's specific sub-tags within <citation>
+                    value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
+                    bibliography_map[key] = value
+
+        if bibliography_map:
+            logging.info(f"Parsed bibliography using Wiley strategy for {self.xml_path}")
+        return bibliography_map
     
     def get_full_text(self) -> str:
         """Extracts all human-readable text from the parsed document."""
