@@ -151,6 +151,12 @@ class XMLParser:
             self._bib_map = bib_map
             return self._bib_map
 
+        # Fallback to BioC strategy
+        bib_map = self._parse_bib_bioc()
+        if bib_map:
+            self._bib_map = bib_map
+            return self._bib_map
+
         self._bib_map = {}
         return self._bib_map
 
