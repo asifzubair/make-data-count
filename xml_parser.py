@@ -298,18 +298,10 @@ class XMLParser:
                         logging.info(f"Skipping likely section title in BioC for {self.xml_path}: '{ref_string}'")
                         continue
 
-                # Look for DOI specifically
-                doi_value = None
-                for key_inf, val_inf in passage_infons.items():
-                    if key_inf.lower() in ['doi', 'pub-id_doi']:
-                        doi_value = val_inf
-                        break # Take the first one found
-
+                # DOI will be included if it's part of the text collected in ref_parts.
+                # No separate DOI field for consistency with other parsers for now.
                 ref_counter += 1
-                bibliography_map[str(ref_counter)] = {
-                    "text": ref_string,
-                    "doi": doi_value
-                }
+                bibliography_map[str(ref_counter)] = ref_string
 
         if bibliography_map:
             logging.info(f"Parsed bibliography using BioC strategy for {self.xml_path} (found {ref_counter} refs)")
