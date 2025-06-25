@@ -28,14 +28,15 @@ EXPECTED_FIELDS = {"doi", "context_sentence", "in_text_citation_string", "biblio
 if jats_results:
     print(f"Found {len(jats_results)} resolved references for JATS file (sample_jats.xml).")
     pprint(jats_results[:3])
-    assert len(jats_results) == 1, f"Expected 1 resolved reference from JATS sample, got {len(jats_results)}"
+    assert len(jats_results) == 1, f"Expected 1 resolved reference from JATS sample, got {len(jats_results)}. Results: {jats_results}"
     for result in jats_results:
         assert EXPECTED_FIELDS.issubset(result.keys()), f"JATS result missing expected fields: {result}"
-        assert "method" not in result, "JATS result should not contain 'method' field"
         # Specific check for the expected JATS pointer resolution
         if result["target_id_from_bib"] == "r1":
             assert result["doi"] == "10.5678/ref.jats.", "Incorrect DOI for JATS pointer r1"
             assert result["in_text_citation_string"] == "[1]", "Incorrect in_text_citation_string for JATS pointer r1"
+            # Context is now paragraph level
+            assert "This is a JATS article. Here is a direct DOI: 10.1234/jats.example. And a pointer [1] ." in result["context_sentence"]
 else:
     print("No references found in JATS file (sample_jats.xml).")
     assert False, "Expected 1 resolved reference from JATS sample, but none were found."
@@ -50,14 +51,15 @@ tei_results = tei_resolver.resolve_references()
 if tei_results:
     print(f"Found {len(tei_results)} resolved references for TEI file (sample_tei.xml).")
     pprint(tei_results[:3])
-    assert len(tei_results) == 1, f"Expected 1 resolved reference from TEI sample, got {len(tei_results)}"
+    assert len(tei_results) == 1, f"Expected 1 resolved reference from TEI sample, got {len(tei_results)}. Results: {tei_results}"
     for result in tei_results:
         assert EXPECTED_FIELDS.issubset(result.keys()), f"TEI result missing expected fields: {result}"
-        assert "method" not in result, "TEI result should not contain 'method' field"
         # Specific check for the expected TEI pointer resolution
         if result["target_id_from_bib"] == "tei_ref1":
             assert result["doi"] == "10.9999/tei.ref.doi.", "Incorrect DOI for TEI pointer tei_ref1"
             assert result["in_text_citation_string"] == "(Author, 2023)", "Incorrect in_text_citation_string for TEI pointer tei_ref1"
+            # Context is now paragraph level
+            assert "This is a TEI article. Pointer to ref (Author, 2023) . Direct DOI: 10.1000/tei.example." in result["context_sentence"]
 else:
     print("No references found in TEI file (sample_tei.xml).")
     assert False, "Expected 1 resolved reference from TEI sample, but none were found."

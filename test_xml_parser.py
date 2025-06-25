@@ -60,14 +60,39 @@ class TestXMLParser(unittest.TestCase):
         self.assertNotIn("First JATS reference content", full_text)
         self.assertNotIn("References", full_text) # Title of ref-list should be excluded
 
-        pointer_map = parser.get_pointer_map()
-        self.assertIn("b1", pointer_map)
-        self.assertEqual(pointer_map["b1"], "[1]")
-        self.assertIn("b2", pointer_map)
-        self.assertEqual(pointer_map["b2"], "(See Author et al. 2020)")
-        self.assertIn("b3", pointer_map)
-        self.assertEqual(pointer_map["b3"], "[b3]") # Default text for empty xref
-        self.assertEqual(len(pointer_map), 3)
+        contextual_pointers = parser.get_pointer_map()
+        self.assertIsInstance(contextual_pointers, list)
+        self.assertEqual(len(contextual_pointers), 3, f"Expected 3 pointers, got {len(contextual_pointers)}")
+
+        expected_pointers_summary = { # target_id: expected_in_text_string
+            "b1": "[1]",
+            "b2": "(See Author et al. 2020)",
+            "b3": "[b3]"
+        }
+
+        found_targets = set()
+        for ptr_info in contextual_pointers:
+            self.assertIn("target_id", ptr_info)
+            self.assertIn("in_text_citation_string", ptr_info)
+            self.assertIn("context_text", ptr_info)
+            self.assertIn("citation_tag_name", ptr_info)
+            self.assertIn("citation_tag_attributes", ptr_info)
+
+            target_id = ptr_info["target_id"]
+            found_targets.add(target_id)
+            self.assertIn(target_id, expected_pointers_summary, f"Unexpected target_id {target_id} found.")
+            self.assertEqual(ptr_info["in_text_citation_string"], expected_pointers_summary[target_id])
+
+            if ptr_info["in_text_citation_string"] == f"[{ptr_info['target_id']}]" and target_id == "b3": # Specifically for the empty <xref rid="b3"/>
+                self.assertTrue(len(ptr_info["context_text"]) > 0, f"Context text should be present for empty tag {target_id}")
+                # self.assertNotIn("[b3]", ptr_info["context_text"], "Generated text for empty tag should not be in context (JATS b3)")
+            else:
+                self.assertIn(ptr_info["in_text_citation_string"], ptr_info["context_text"],
+                              f"In-text string '{ptr_info['in_text_citation_string']}' not in context '{ptr_info['context_text']}' for {target_id}")
+
+            self.assertEqual(ptr_info["citation_tag_name"], "xref")
+
+        self.assertEqual(found_targets, set(expected_pointers_summary.keys()), "Not all expected targets were found.")
 
     def test_tei_parsing(self):
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>
@@ -102,14 +127,37 @@ class TestXMLParser(unittest.TestCase):
         self.assertNotIn("Ref1 Title", full_text)
         self.assertNotIn("bibliography", full_text)
 
-        pointer_map = parser.get_pointer_map()
-        self.assertIn("ref1", pointer_map)
-        self.assertEqual(pointer_map["ref1"], "(Author, 2021)")
-        self.assertIn("ref2", pointer_map)
-        self.assertEqual(pointer_map["ref2"], "[2]")
-        self.assertIn("ref3", pointer_map)
-        self.assertEqual(pointer_map["ref3"], "[ref3]") # Default text for empty ref
-        self.assertEqual(len(pointer_map), 3)
+        contextual_pointers = parser.get_pointer_map()
+        self.assertIsInstance(contextual_pointers, list)
+        self.assertEqual(len(contextual_pointers), 3, f"Expected 3 TEI pointers, got {len(contextual_pointers)}")
+
+        expected_pointers_summary = {
+            "ref1": "(Author, 2021)",
+            "ref2": "[2]",
+            "ref3": "[ref3]"
+        }
+
+        found_targets = set()
+        for ptr_info in contextual_pointers:
+            self.assertIn("target_id", ptr_info)
+            self.assertIn("in_text_citation_string", ptr_info)
+            self.assertIn("context_text", ptr_info)
+            self.assertEqual(ptr_info["citation_tag_name"], "ref") # TEI sample uses <ref>
+
+            target_id = ptr_info["target_id"]
+            found_targets.add(target_id)
+            self.assertIn(target_id, expected_pointers_summary, f"Unexpected TEI target_id {target_id} found.")
+            self.assertEqual(ptr_info["in_text_citation_string"], expected_pointers_summary[target_id])
+
+            if ptr_info["in_text_citation_string"] == f"[{ptr_info['target_id']}]" and target_id == "ref3": # Specifically for empty <ref target="#ref3"/>
+                self.assertTrue(len(ptr_info["context_text"]) > 0, f"Context text should be present for empty tag {target_id}")
+            else:
+                self.assertIn(ptr_info["in_text_citation_string"], ptr_info["context_text"])
+
+            if target_id == "ref3": # Empty ref - check generated text
+                 self.assertTrue(ptr_info["in_text_citation_string"].startswith("[") and ptr_info["in_text_citation_string"].endswith("]"))
+
+        self.assertEqual(found_targets, set(expected_pointers_summary.keys()), "Not all expected TEI targets were found.")
 
     def test_wiley_parsing_jats_like(self): # Renaming to test_wiley_parsing
         # This sample now includes <link href="..."> and also <bib xml:id> for bib parsing
@@ -157,22 +205,34 @@ class TestXMLParser(unittest.TestCase):
         self.assertNotIn("Wiley reference content 3 for link", full_text)
         self.assertNotIn("References", full_text) # Title of ref-list
 
+        contextual_pointers = parser.get_pointer_map()
+        self.assertIsInstance(contextual_pointers, list)
+        self.assertEqual(len(contextual_pointers), 4, f"Expected 4 Wiley pointers, got {len(contextual_pointers)}. Pointers: {contextual_pointers}")
 
-        pointer_map = parser.get_pointer_map()
-        self.assertEqual(len(pointer_map), 4, f"Expected 4 pointers, found {len(pointer_map)}. Map: {pointer_map}")
+        expected_pointers_summary = { # target_id: {text: ..., tag: ...}
+            "w1": {"text": "[WileyRef1]", "tag": "xref"},
+            "w2": {"text": "(Wiley 2022)", "tag": "ref"},
+            "w3": {"text": "2023", "tag": "link"},
+            "w4": {"text": "[w4]", "tag": "link"}
+        }
 
-        self.assertIn("w1", pointer_map) # Caught by <xref>
-        self.assertEqual(pointer_map["w1"], "[WileyRef1]")
+        found_targets_wiley = set()
+        for ptr_info in contextual_pointers:
+            self.assertIn("target_id", ptr_info)
+            target_id = ptr_info["target_id"]
+            found_targets_wiley.add(target_id)
 
-        self.assertIn("w2", pointer_map) # Caught by generic <ref target>
-        self.assertEqual(pointer_map["w2"], "(Wiley 2022)")
+            self.assertIn(target_id, expected_pointers_summary, f"Unexpected Wiley target_id {target_id} found in {ptr_info}")
+            expected = expected_pointers_summary[target_id]
+            self.assertEqual(ptr_info["in_text_citation_string"], expected["text"])
+            self.assertEqual(ptr_info["citation_tag_name"], expected["tag"])
 
-        self.assertIn("w3", pointer_map) # Caught by new <link href> logic
-        self.assertEqual(pointer_map["w3"], "2023")
+            if ptr_info["in_text_citation_string"] == f"[{ptr_info['target_id']}]" and target_id == "w4": # Specifically for empty <link href="#w4"/>
+                self.assertTrue(len(ptr_info["context_text"]) > 0, f"Context text should be present for empty tag {target_id}")
+            else:
+                self.assertIn(ptr_info["in_text_citation_string"], ptr_info["context_text"])
 
-        self.assertIn("w4", pointer_map) # Caught by new <link href> logic with default text
-        self.assertEqual(pointer_map["w4"], "[w4]")
-
+        self.assertEqual(found_targets_wiley, set(expected_pointers_summary.keys()), "Not all expected Wiley targets were found.")
 
     def test_bioc_parsing(self):
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>
@@ -244,13 +304,32 @@ class TestXMLParser(unittest.TestCase):
         self.assertIn("This is a BioC paragraph", full_text)
         self.assertNotIn("BioC Reference Item 1", full_text)
 
-        pointer_map = parser.get_pointer_map()
-        self.assertIn("bib1", pointer_map, f"Pointer map was: {pointer_map}. Bib map: {parser.get_bibliography_map()}")
-        self.assertEqual(pointer_map["bib1"], "[REF1]")
-        self.assertIn("bib2", pointer_map, f"Pointer map was: {pointer_map}. Bib map: {parser.get_bibliography_map()}")
-        self.assertEqual(pointer_map["bib2"], "(See Ref 2)")
-        self.assertEqual(len(pointer_map), 2)
+        contextual_pointers = parser.get_pointer_map()
+        self.assertIsInstance(contextual_pointers, list)
+        self.assertEqual(len(contextual_pointers), 2, f"Expected 2 BioC pointers, got {len(contextual_pointers)}. Pointers: {contextual_pointers}")
 
+        expected_pointers_summary = { # target_id: expected_in_text_string
+            "bib1": "[REF1]",
+            "bib2": "(See Ref 2)"
+        }
+
+        found_targets_bioc = set()
+        for ptr_info in contextual_pointers:
+            self.assertIn("target_id", ptr_info)
+            target_id = ptr_info["target_id"]
+            found_targets_bioc.add(target_id)
+
+            self.assertIn(target_id, expected_pointers_summary, f"Unexpected BioC target_id {target_id} found.")
+            self.assertEqual(ptr_info["in_text_citation_string"], expected_pointers_summary[target_id])
+            self.assertEqual(ptr_info["citation_tag_name"], "annotation")
+            # Context for BioC annotations is tricky; the annotation itself is often within the context.
+            # A simple check:
+            self.assertTrue(len(ptr_info["context_text"]) > 0, "BioC context text should not be empty")
+            self.assertIn(ptr_info["in_text_citation_string"], ptr_info["context_text"],
+                          f"BioC in-text string '{ptr_info['in_text_citation_string']}' not in context '{ptr_info['context_text']}'")
+
+
+        self.assertEqual(found_targets_bioc, set(expected_pointers_summary.keys()), "Not all expected BioC targets were found.")
 
     def test_fallback_full_text_exclusion(self):
         xml_content = """<?xml version="1.0"?>
@@ -294,15 +373,33 @@ class TestXMLParser(unittest.TestCase):
         self.assertTrue(parser.soup is not None, "Soup object should not be None")
         parser.bibliography_format_used = "unknown"
 
-        pointer_map = parser.get_pointer_map()
-        self.assertIn("r1", pointer_map)
-        self.assertEqual(pointer_map["r1"], "[X1]")
-        self.assertIn("r2", pointer_map) # _get_pointers_generic checks xref if first pass is empty
-        self.assertEqual(pointer_map["r2"], "(Y2)")
-        self.assertIn("r3", pointer_map)
-        self.assertEqual(pointer_map["r3"], "r3") # Fallback text for empty ref with target
-        self.assertEqual(len(pointer_map), 3)
+        contextual_pointers = parser.get_pointer_map() # Should call _get_pointers_generic
+        self.assertIsInstance(contextual_pointers, list)
+        self.assertEqual(len(contextual_pointers), 3, f"Expected 3 fallback pointers, got {len(contextual_pointers)}")
 
+        expected_pointers_summary = {
+            "r1": {"text": "[X1]", "tag": "ref"},
+            "r2": {"text": "(Y2)", "tag": "xref"},
+            "r3": {"text": "[r3]", "tag": "ref"} # Adjusted expected text for empty ref with target
+        }
+
+        found_targets_fallback = set()
+        for ptr_info in contextual_pointers:
+            self.assertIn("target_id", ptr_info)
+            target_id = ptr_info["target_id"]
+            found_targets_fallback.add(target_id)
+
+            self.assertIn(target_id, expected_pointers_summary, f"Unexpected fallback target_id {target_id} found.")
+            expected = expected_pointers_summary[target_id]
+            self.assertEqual(ptr_info["in_text_citation_string"], expected["text"])
+            self.assertEqual(ptr_info["citation_tag_name"], expected["tag"])
+
+            if ptr_info["in_text_citation_string"] == f"[{ptr_info['target_id']}]" and target_id == "r3": # Specifically for empty <ref type="bibr" target="#r3"/>
+                self.assertTrue(len(ptr_info["context_text"]) > 0, f"Context text should be present for empty tag {target_id}")
+            else:
+                self.assertIn(ptr_info["in_text_citation_string"], ptr_info["context_text"])
+
+        self.assertEqual(found_targets_fallback, set(expected_pointers_summary.keys()), "Not all expected fallback targets were found.")
 
 if __name__ == '__main__':
     unittest.main()

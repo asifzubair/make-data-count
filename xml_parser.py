@@ -473,19 +473,27 @@ class XMLParser:
             # Fallback for unknown or undetermined format - use the old generic logic
             return self._get_pointers_generic()
 
-    def _get_pointers_generic(self) -> dict:
+    def _get_pointers_generic(self) -> list[dict]: # Return type changed
         """Generic pointer extraction, used as a fallback."""
-        if not self.soup: return {}
-        pointers_map = {}
+        if not self.soup: return [] # Return type changed
+        pointers_list = [] # Changed from pointers_map
         # This is the old logic, primarily JATS-like
         # Look for <ref type="bibr" target="...">
         for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
             target = tag.get('target')
             if target:
                 text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): # If ref tag is empty, use the target ID as text
-                    text = target.lstrip('#') # Use raw target id as text if none exists
-                pointers_map[target.lstrip('#')] = ' '.join(text.split())
+                if not text.strip(): # If ref tag is empty, use a generated string like [ID]
+                    text = f"[{target.lstrip('#')}]"
+
+                context_text = self._find_contextual_parent_text(tag)
+                pointers_list.append({
+                    "target_id": target.lstrip('#'),
+                    "in_text_citation_string": ' '.join(text.split()),
+                    "context_text": context_text,
+                    "citation_tag_name": tag.name,
+                    "citation_tag_attributes": tag.attrs
+                })
 
         # Also look for <xref ref-type="bibr" rid="..."> which is common in JATS
         # Removed 'if not pointers_map:' to collect both types
@@ -493,14 +501,49 @@ class XMLParser:
             target_id = tag.get('rid')
             if target_id:
                 text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): text = target_id.lstrip('#') # Fallback text, use raw rid
-                pointers_map[target_id.lstrip('#')] = ' '.join(text.split())
-        return pointers_map
+                if not text.strip(): text = f"[{target_id.lstrip('#')}]" # Fallback text, use [ID] format
 
-    def _get_pointers_jats(self) -> dict:
+                context_text = self._find_contextual_parent_text(tag)
+                pointers_list.append({
+                    "target_id": target_id.lstrip('#'),
+                    "in_text_citation_string": ' '.join(text.split()),
+                    "context_text": context_text,
+                    "citation_tag_name": tag.name,
+                    "citation_tag_attributes": tag.attrs
+                })
+        return pointers_list
+
+    def _find_contextual_parent_text(self, tag, max_depth=5) -> str:
+        """
+        Finds the text of the closest relevant block-level parent of a tag.
+        Searches up to max_depth.
+        """
+        context_parent_tags = ['p', 'div', 'li', 'section', 'article-section', 'body', 'article-body', 'text'] # Add more as needed
+        current_tag = tag
+        for _ in range(max_depth):
+            parent = current_tag.parent
+            if not parent:
+                break
+            # Check if parent.name (local name) is in our list of contextual tags
+            if parent.name and parent.name.lower() in context_parent_tags:
+                return ' '.join(parent.get_text(separator=' ', strip=True).split())
+            current_tag = parent
+
+        # Fallback: if no specific context parent found within depth, return text of the original tag's immediate parent
+        if tag.parent:
+            return ' '.join(tag.parent.get_text(separator=' ', strip=True).split())
+        return "" # Should ideally not happen if tag itself exists
+
+    def _get_pointers_jats(self) -> list[dict]: # Return type changed
         """Extracts in-text citation pointers for JATS format."""
-        if not self.soup: return {}
-        pointers_map = {}
+        if not self.soup: return [] # Return empty list
+        pointers_list = []
+
+        # Using a set to keep track of processed target_ids to avoid duplicates
+        # if multiple rules could match the same conceptual pointer.
+        # However, different tags pointing to the same target_id with different context/text are preserved.
+        # This specific duplicate handling might be refined based on desired behavior.
+
         # Prioritize <xref ref-type="bibr" rid="ID">text</xref>
         for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
             target_id = tag.get('rid')
@@ -508,133 +551,209 @@ class XMLParser:
                 text = tag.get_text(separator=' ', strip=True)
                 if not text.strip(): # If xref is empty but has rid, use the rid as text like [rid]
                     text = f"[{target_id.lstrip('#')}]"
-                pointers_map[target_id.lstrip('#')] = ' '.join(text.split())
+
+                context_text = self._find_contextual_parent_text(tag)
+                pointers_list.append({
+                    "target_id": target_id.lstrip('#'),
+                    "in_text_citation_string": ' '.join(text.split()),
+                    "context_text": context_text,
+                    "citation_tag_name": tag.name,
+                    "citation_tag_attributes": tag.attrs
+                })
 
         # Fallback or alternative: <ref type="bibr" target="#ID">text</ref>
-        # This check is to avoid overwriting if xrefs were already found and are preferred.
-        # However, some documents might use only <ref> for this.
-        # A simple way: if pointers_map is still empty, try the other style.
-        if not pointers_map:
-            for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
-                target = tag.get('target') # JATS often uses target="#id"
-                if target:
-                    text = tag.get_text(separator=' ', strip=True)
-                    if not text.strip(): # If ref tag is empty, use the target ID as text
-                         text = f"[{target.lstrip('#')}]"
-                    pointers_map[target.lstrip('#')] = ' '.join(text.split())
-        return pointers_map
+        # Only add if not already captured by a similar <xref> to the same target from same conceptual location.
+        # For simplicity now, we'll add all found, potential duplicates can be handled by consumer or by refining keying here.
+        # The current _find_contextual_parent_text might give same context if xref and ref are siblings for same target.
 
-    def _get_pointers_tei(self) -> dict:
+        # To avoid adding a <ref> if an <xref> already covered it for the same conceptual pointer,
+        # we might need a more complex check than just target_id, e.g. involving source line numbers or exact context.
+        # For now, let's assume that JATS files will use one style or the other consistently for a given pointer,
+        # or that downstream processing can handle multiple "views" of the same conceptual pointer if structure is weird.
+
+        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
+            target = tag.get('target') # JATS often uses target="#id"
+            if target:
+                target_id = target.lstrip('#')
+                # Simple check: if this target_id was already added by an xref, skip.
+                # This assumes xref is preferred. This is a basic de-duplication.
+                already_added_by_xref = False
+                for p_dict in pointers_list:
+                    if p_dict["target_id"] == target_id and p_dict["citation_tag_name"] == 'xref':
+                        already_added_by_xref = True
+                        break
+                if already_added_by_xref:
+                    continue
+
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): # If ref tag is empty, use the target ID as text
+                     text = f"[{target_id}]" # Use target_id not target.lstrip('#') for consistency
+
+                context_text = self._find_contextual_parent_text(tag)
+                pointers_list.append({
+                    "target_id": target_id,
+                    "in_text_citation_string": ' '.join(text.split()),
+                    "context_text": context_text,
+                    "citation_tag_name": tag.name,
+                    "citation_tag_attributes": tag.attrs
+                })
+        return pointers_list
+
+    def _get_pointers_tei(self) -> list[dict]: # Return type changed
         """Extracts in-text citation pointers for TEI format."""
-        if not self.soup: return {}
-        pointers_map = {}
+        if not self.soup: return [] # Return empty list
+        pointers_list = []
         # Look for <ref target="#ID">text</ref>
         for tag in self.soup.find_all('ref'): # TEI <ref> might not have a 'type'
             target = tag.get('target')
             if target and target.startswith('#'): # Ensure it's an internal link
+                target_id = target.lstrip('#')
                 text = tag.get_text(separator=' ', strip=True)
                 if not text.strip(): # If ref tag is empty, use the target ID as text
-                    text = f"[{target.lstrip('#')}]"
-                pointers_map[target.lstrip('#')] = ' '.join(text.split())
-
-        # Consider <ptr target="#ID"/> (usually for pointers without specific display text)
-        # If no <ref> tags with text were found, or to supplement.
-        # For now, let's assume <ref> with text is primary. If specific cases for <ptr> arise,
-        # we can add logic, e.g. if tag.get_text() is empty.
-        return pointers_map
-
-    def _get_pointers_wiley(self) -> dict:
-        """Extracts in-text citation pointers for Wiley format."""
-        if not self.soup: return {}
-        pointers_map = {}
-        # Wiley can be JATS-like, so try JATS patterns first.
-        # <xref ref-type="bibr" rid="ID">text</xref>
-        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
-            target_id = tag.get('rid')
-            if target_id:
-                text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): text = f"[{target_id.lstrip('#')}]"
-                pointers_map[target_id.lstrip('#')] = ' '.join(text.split())
-
-        # <ref type="bibr" target="#ID">text</ref> (less common in Wiley but possible)
-        # Removed 'if not pointers_map:'
-        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
-            target = tag.get('target')
-            if target and target.startswith('#'):
-                text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): text = f"[{target.lstrip('#')}]"
-                pointers_map[target.lstrip('#')] = ' '.join(text.split())
-
-        # Attempt 3: Wiley-specific <link href="#ID">text</link>
-        for tag in self.soup.find_all('link'): # Find all <link> tags
-            target_href = tag.get('href')
-            if target_href and target_href.startswith('#'): # Check for internal href
-                target_id = target_href.lstrip('#')
-                text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): text = f"[{target_id}]" # Default text if link tag is empty
-
-                # Add if not already found by a more specific rule, or if this text is better
-                if target_id not in pointers_map or pointers_map[target_id].startswith('['):
-                    pointers_map[target_id] = ' '.join(text.split())
-
-        # Attempt 4: Generic <ref target="..."> (fallback)
-        # This would require knowledge of Wiley's specific DTDs/schemas, which vary.
-        # For now, we rely on JATS-like patterns which are common.
-        # A more robust Wiley parser would need to inspect actual Wiley XML samples for their pointer styles.
-        for tag in self.soup.find_all('ref'):
-            # Avoid re-processing if already found by type='bibr'
-            if 'type' in tag.attrs and tag.attrs['type'] == 'bibr':
-                continue
-            target = tag.get('target')
-            # More general heuristic for target IDs (e.g., #w2, #ref2, #bibItem2)
-            if target and target.startswith('#') and re.match(r'#([a-zA-Z0-9\-_.:]+)', target):
-                target_id = target.lstrip('#') # Ensure we use target_id consistently
-                text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): text = f"[{target_id}]"
-                # Ensure we don't overwrite an existing entry from a more specific rule unless text is better
-                if target_id not in pointers_map or pointers_map[target_id].startswith('['):
-                    pointers_map[target_id] = ' '.join(text.split())
-        return pointers_map
-
-    def _get_pointers_bioc(self) -> dict:
-        """
-        Extracts in-text citation pointers for BioC format.
-        This is complex as BioC may not have explicit pointer tags.
-        Relies on finding <annotation> elements that are typed as citations
-        and link to a bibliography item.
-        """
-        if not self.soup: return {}
-        pointers_map = {}
-
-        # Ideal case: BioC <annotation> tags for citations
-        # Example structure we're looking for:
-        # <annotation id="A4">
-        #   <infon key="type">citation</infon>
-        #   <infon key="referenced_bib_id">B1</infon> <!-- ID from <listBibl> -->
-        #   <location length="3" offset="202"/>
-        #   <text>[1]</text>
-        # </annotation>
-        for ann_tag in self.soup.find_all('annotation'):
-            is_citation_annotation = False
-            target_id = None
-            text = None
-
-            for infon_tag in ann_tag.find_all('infon'):
-                if infon_tag.get('key') == 'type' and infon_tag.text.lower() in ['citation', 'reference', 'bibr']:
-                    is_citation_annotation = True
-                if infon_tag.get('key') in ['referenced_bib_id', 'target_id', 'rid', 'target']: # Common keys for target
-                    target_id = infon_tag.text.strip().lstrip('#')
-
-            if is_citation_annotation and target_id:
-                text_tag = ann_tag.find('text')
-                if text_tag and text_tag.text.strip():
-                    text = text_tag.text.strip()
-                else: # If no <text> tag or empty, use a placeholder based on target_id
                     text = f"[{target_id}]"
 
-                pointers_map[target_id] = ' '.join(text.split())
+                context_text = self._find_contextual_parent_text(tag)
+                pointers_list.append({
+                    "target_id": target_id,
+                    "in_text_citation_string": ' '.join(text.split()),
+                    "context_text": context_text,
+                    "citation_tag_name": tag.name,
+                    "citation_tag_attributes": tag.attrs
+                })
+
+        # Also consider <ptr target="#ID"/>, often used for empty pointers.
+        for tag in self.soup.find_all('ptr'):
+            target = tag.get('target')
+            if target and target.startswith('#'):
+                target_id = target.lstrip('#')
+                # Check if this pointer (target_id) was already captured by a <ref> tag.
+                # This avoids duplicates if a <ptr> and <ref> point to the same thing, preferring <ref> if it had text.
+                already_added = any(p_dict["target_id"] == target_id for p_dict in pointers_list)
+                if already_added:
+                    continue
+
+                text = f"[{target_id}]" # <ptr> tags are usually empty, so generate text
+                context_text = self._find_contextual_parent_text(tag)
+                pointers_list.append({
+                    "target_id": target_id,
+                    "in_text_citation_string": text, # No .split() needed for generated text
+                    "context_text": context_text,
+                    "citation_tag_name": tag.name,
+                    "citation_tag_attributes": tag.attrs
+                })
+        return pointers_list
+
+    def _get_pointers_wiley(self) -> list[dict]: # Return type changed
+        """Extracts in-text citation pointers for Wiley format."""
+        if not self.soup: return [] # Return empty list
+        pointers_list = []
+
+        # Helper to create and add pointer dict to list
+        def _add_wiley_pointer(tag, target_id_attr_name, id_prefix=''):
+            target_val = tag.get(target_id_attr_name)
+            if target_val:
+                target_id = target_val.lstrip(id_prefix) # Handles href="#" or rid=""
+                text_content = tag.get_text(separator=' ', strip=True)
+                if not text_content.strip():
+                    text_content = f"[{target_id}]"
+
+                context_text = self._find_contextual_parent_text(tag)
+                # Basic de-duplication: check if this exact pointer (target_id + text + context) is already added
+                # This is very basic; a more robust check might be needed if tags are nested weirdly
+                # For now, we assume different tags or locations mean different conceptual pointers even if text/target are same
+
+                # A simple way to avoid adding the exact same dictionary again if multiple rules match same tag
+                new_pointer = {
+                    "target_id": target_id,
+                    "in_text_citation_string": ' '.join(text_content.split()),
+                    "context_text": context_text,
+                    "citation_tag_name": tag.name,
+                    "citation_tag_attributes": tag.attrs
+                }
+                # This check for full dict duplication is probably too strict or unnecessary
+                # if not any(p == new_pointer for p in pointers_list):
+                #    pointers_list.append(new_pointer)
+                # Let's just add for now and assume consumer handles semantic duplicates if needed.
+                # Or, add a set of (target_id, context_text_start_few_chars, in_text_string) to avoid obvious re-adds
+                pointers_list.append(new_pointer)
+
+
+        # Attempt 1: JATS-like <xref ref-type="bibr" rid="ID">text</xref>
+        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
+            _add_wiley_pointer(tag, 'rid')
+
+        # Attempt 2: <ref type="bibr" target="#ID">text</ref>
+        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
+            _add_wiley_pointer(tag, 'target', id_prefix='#')
+
+        # Attempt 3: Wiley-specific <link href="#ID">text</link>
+        for tag in self.soup.find_all('link'):
+            _add_wiley_pointer(tag, 'href', id_prefix='#')
+
+        # Attempt 4: Generic <ref target="..."> (fallback)
+        # Only if it wasn't already processed as a <ref type="bibr">
+        processed_ref_targets_from_bibr = {p['target_id'] for p in pointers_list if p['citation_tag_name'] == 'ref' and p['citation_tag_attributes'].get('type') == 'bibr'}
+
+        for tag in self.soup.find_all('ref'):
+            if tag.attrs.get('type') == 'bibr': # Already handled by Attempt 2
+                continue
+
+            target = tag.get('target')
+            if target and target.startswith('#') and re.match(r'#([a-zA-Z0-9\-_.:]+)', target):
+                if target.lstrip('#') in processed_ref_targets_from_bibr: # Avoid double adding from specific rule
+                    continue
+                _add_wiley_pointer(tag, 'target', id_prefix='#')
+
+        return pointers_list
+
+    def _get_pointers_bioc(self) -> list[dict]: # Return type changed
+        """
+        Extracts in-text citation pointers for BioC format.
+        Relies on finding <annotation> elements that are typed as citations
+        and link to a bibliography item (or an internally generated ID).
+        """
+        if not self.soup: return [] # Return empty list
+        pointers_list = []
+
+        for ann_tag in self.soup.find_all('annotation'):
+            is_citation_annotation = False
+            target_id_from_infon = None
+            in_text_citation_string = None
+
+            infons = ann_tag.find_all('infon')
+            temp_attrs = {infon.get('key'): infon.text for infon in infons if infon.get('key')}
+
+
+            for infon_tag in infons: # Re-iterate to ensure order of preference for keys if multiple exist
+                key_attr = infon_tag.get('key')
+                if key_attr == 'type' and infon_tag.text.lower() in ['citation', 'reference', 'bibr', 'ref']:
+                    is_citation_annotation = True
+                # Prioritize specific keys for target_id
+                if key_attr in ['referenced_bib_id', 'target_bib_id', 'targetid', 'rid', 'target_id', 'target']:
+                    target_id_from_infon = infon_tag.text.strip().lstrip('#')
+                    # Break if a high-priority target key is found, or define an order
+                    # For now, last one found with these keys will be used. More specific logic might be needed.
+
+            if is_citation_annotation and target_id_from_infon:
+                text_tag = ann_tag.find('text')
+                if text_tag and text_tag.text.strip():
+                    in_text_citation_string = text_tag.text.strip()
+                else:
+                    # If no <text> tag or empty, use a placeholder based on target_id_from_infon
+                    # Or, if the annotation tag itself has text (unlikely for BioC but possible)
+                    ann_tag_direct_text = ann_tag.text # This gets all text within annotation, including infons, be careful
+                    # A better fallback might be just the ID.
+                    in_text_citation_string = f"[{target_id_from_infon}]"
+
+                context_text = self._find_contextual_parent_text(ann_tag)
+                pointers_list.append({
+                    "target_id": target_id_from_infon,
+                    "in_text_citation_string": ' '.join(in_text_citation_string.split()),
+                    "context_text": context_text,
+                    "citation_tag_name": ann_tag.name, # "annotation"
+                    "citation_tag_attributes": temp_attrs # Store all infons as attributes
+                })
 
         # If no explicit annotations found, this method won't find pointers for BioC.
-        # Pattern matching (e.g., for "[1]") in text is too unreliable without linking information.
-        return pointers_map
+        return pointers_list
 

@@ -57,62 +57,58 @@ class ReferenceResolver:
         Processes the entire document to find and resolve all references.
         """
         resolved_citations = []
-        logging.info(f"RR: Starting resolve_references. Found {len(self.sentences)} sentences. Document pointers available: {len(self.document_pointers)}")
+        # self.document_pointers is now a list of dicts
+        logging.info(f"RR: Starting resolve_references. Document pointers available: {len(self.document_pointers)}")
         
-        for i, sent in enumerate(self.sentences):
-            sentence_text = sent.text
-            logging.debug(f"RR: Processing sentence {i+1}/{len(self.sentences)}: '{sentence_text[:100]}...'")
+        # The main loop now iterates through the contextual pointers from XMLParser
+        for i, pointer_info in enumerate(self.document_pointers):
+            target_id = pointer_info["target_id"]
+            in_text_citation_string = pointer_info["in_text_citation_string"]
+            # context_text is the paragraph-level context from XMLParser
+            context_text_from_parser = pointer_info["context_text"]
 
-            is_candidate_sentence = self._is_candidate(sentence_text)
-            if not is_candidate_sentence:
-                logging.debug(f"RR: Sentence {i+1} skipped by _is_candidate.")
-                continue
+            logging.debug(f"RR: Processing pointer {i+1}/{len(self.document_pointers)}: target_id='{target_id}', text='{in_text_citation_string}', context='{context_text_from_parser[:100]}...'")
 
-            logging.info(f"RR: Sentence {i+1} IS a candidate. Checking {len(self.document_pointers)} pointers.")
+            full_ref_text = self.bib_map.get(target_id)
 
-            # Direct DOI detection logic removed as per new strategy.
+            if full_ref_text:
+                logging.debug(f"RR: Bib entry for '{target_id}': '{full_ref_text[:100]}...'")
+                doi_match_in_ref = self._direct_doi_pattern.search(full_ref_text)
+                if doi_match_in_ref:
+                    found_doi = doi_match_in_ref.group(0)
+                    logging.info(f"RR: DOI '{found_doi}' found in bib entry for '{target_id}' (linked by '{in_text_citation_string}').")
 
-            # Logic for pointer resolution using self.document_pointers
-            for ptr_idx, (target_id, pointer_text_in_document) in enumerate(self.document_pointers.items()):
-                logging.debug(f"RR: Sentence {i+1}, Pointer {ptr_idx+1}/{len(self.document_pointers)}: Checking for '{pointer_text_in_document}'")
-                # Check if the specific pointer text (e.g., "[1]", "(Author 2020)") appears in the current sentence
-                if pointer_text_in_document in sentence_text:
-                    logging.info(f"RR: Sentence {i+1}: Found pointer text '{pointer_text_in_document}' targeting bib ID '{target_id}'.")
-                    full_ref_text = self.bib_map.get(target_id) # target_id is already clean from parser
+                    # De-duplication: Check if this exact DOI, from this exact bib entry, using this pointer text,
+                    # with this exact broader context has already been added.
+                    # This de-duplication might be overly specific if context_text_from_parser is very long and varies slightly
+                    # for what is essentially the same conceptual citation.
+                    # A simpler de-dupe might be on (doi, target_id, in_text_citation_string).
+                    is_already_added = False
+                    for res_cit in resolved_citations:
+                        if res_cit["doi"] == found_doi and \
+                           res_cit["target_id_from_bib"] == target_id and \
+                           res_cit["in_text_citation_string"] == in_text_citation_string and \
+                           res_cit["context_sentence"] == context_text_from_parser: # Using new context here
+                            is_already_added = True
+                            logging.debug(f"RR: Duplicate citation skipped: DOI '{found_doi}', TargetID: {target_id}, Pointer: '{in_text_citation_string}'")
+                            break
                     
-                    if full_ref_text:
-                        logging.debug(f"RR: Bib entry for '{target_id}': '{full_ref_text[:100]}...'")
-                        # Search for a DOI within the full reference text from the map
-                        doi_match_in_ref = self._direct_doi_pattern.search(full_ref_text)
-                        if doi_match_in_ref:
-                            found_doi = doi_match_in_ref.group(0)
-                            logging.info(f"RR: DOI '{found_doi}' found in bib entry for '{target_id}'.")
-                            # Basic de-duplication
-                            is_already_added = False
-                            for res_cit in resolved_citations:
-                                if res_cit["doi"] == found_doi and \
-                                   res_cit["context_sentence"] == sentence_text and \
-                                   res_cit["bibliography_entry_text"] == full_ref_text:
-                                    is_already_added = True
-                                    logging.debug(f"RR: Duplicate citation skipped: DOI '{found_doi}', Context: '{sentence_text[:50]}...'")
-                                    break
-
-                            if not is_already_added:
-                                citation_data = {
-                                    "doi": found_doi,
-                                    "context_sentence": sentence_text,
-                                    "in_text_citation_string": pointer_text_in_document,
-                                    "bibliography_entry_text": full_ref_text,
-                                    "target_id_from_bib": target_id
-                                }
-                                resolved_citations.append(citation_data)
-                                logging.info(f"RR: Added resolved citation: {citation_data}")
-                        else:
-                            logging.debug(f"RR: No DOI found in bib entry for '{target_id}'.")
-                    else:
-                        logging.warning(f"RR: Pointer target_id '{target_id}' for text '{pointer_text_in_document}' not found in bib_map.")
-                # else:
-                    # logging.debug(f"RR: Pointer text '{pointer_text_in_document}' not found in current sentence.")
+                    if not is_already_added:
+                        citation_data = {
+                            "doi": found_doi,
+                            "context_sentence": context_text_from_parser, # Use context from parser
+                            "in_text_citation_string": in_text_citation_string,
+                            "bibliography_entry_text": full_ref_text,
+                            "target_id_from_bib": target_id
+                            # We could also add pointer_info["citation_tag_name"] and pointer_info["citation_tag_attributes"]
+                            # if they are useful for the downstream LLM.
+                        }
+                        resolved_citations.append(citation_data)
+                        logging.info(f"RR: Added resolved citation: DOI='{found_doi}', TargetID='{target_id}', Pointer='{in_text_citation_string}'")
+                else:
+                    logging.debug(f"RR: No DOI found in bib entry for '{target_id}'.")
+            else:
+                logging.warning(f"RR: Pointer target_id '{target_id}' for in-text string '{in_text_citation_string}' not found in bib_map.")
                             
         logging.info(f"RR: resolve_references finished. Total resolved citations: {len(resolved_citations)}")
         return resolved_citations
