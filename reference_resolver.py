@@ -72,43 +72,33 @@ class ReferenceResolver:
             full_ref_text = self.bib_map.get(target_id)
 
             if full_ref_text:
-                logging.debug(f"RR: Bib entry for '{target_id}': '{full_ref_text[:100]}...'")
-                doi_match_in_ref = self._direct_doi_pattern.search(full_ref_text)
-                if doi_match_in_ref:
-                    found_doi = doi_match_in_ref.group(0)
-                    logging.info(f"RR: DOI '{found_doi}' found in bib entry for '{target_id}' (linked by '{in_text_citation_string}').")
+                logging.info(f"RR: Bib entry for '{target_id}' (linked by '{in_text_citation_string}') found: '{full_ref_text[:100]}...'")
 
-                    # De-duplication: Check if this exact DOI, from this exact bib entry, using this pointer text,
-                    # with this exact broader context has already been added.
-                    # This de-duplication might be overly specific if context_text_from_parser is very long and varies slightly
-                    # for what is essentially the same conceptual citation.
-                    # A simpler de-dupe might be on (doi, target_id, in_text_citation_string).
-                    is_already_added = False
-                    for res_cit in resolved_citations:
-                        if res_cit["doi"] == found_doi and \
-                           res_cit["target_id_from_bib"] == target_id and \
-                           res_cit["in_text_citation_string"] == in_text_citation_string and \
-                           res_cit["context_sentence"] == context_text_from_parser: # Using new context here
-                            is_already_added = True
-                            logging.debug(f"RR: Duplicate citation skipped: DOI '{found_doi}', TargetID: {target_id}, Pointer: '{in_text_citation_string}'")
-                            break
-                    
-                    if not is_already_added:
-                        citation_data = {
-                            "doi": found_doi,
-                            "context_sentence": context_text_from_parser, # Use context from parser
-                            "in_text_citation_string": in_text_citation_string,
-                            "bibliography_entry_text": full_ref_text,
-                            "target_id_from_bib": target_id
-                            # We could also add pointer_info["citation_tag_name"] and pointer_info["citation_tag_attributes"]
-                            # if they are useful for the downstream LLM.
-                        }
-                        resolved_citations.append(citation_data)
-                        logging.info(f"RR: Added resolved citation: DOI='{found_doi}', TargetID='{target_id}', Pointer='{in_text_citation_string}'")
-                else:
-                    logging.debug(f"RR: No DOI found in bib entry for '{target_id}'.")
+                # DOI search is removed. We add the entry if the bib_ref_text is found.
+
+                # De-duplication: Check if this exact context, pointer, and bib entry has already been added.
+                is_already_added = False
+                for res_cit in resolved_citations:
+                    if res_cit["target_id_from_bib"] == target_id and \
+                       res_cit["in_text_citation_string"] == in_text_citation_string and \
+                       res_cit["context_sentence"] == context_text_from_parser and \
+                       res_cit["bibliography_entry_text"] == full_ref_text: # Check all key fields
+                        is_already_added = True
+                        logging.debug(f"RR: Duplicate resolved reference skipped: TargetID: {target_id}, Pointer: '{in_text_citation_string}'")
+                        break
+
+                if not is_already_added:
+                    citation_data = {
+                        "context_sentence": context_text_from_parser,
+                        "in_text_citation_string": in_text_citation_string,
+                        "bibliography_entry_text": full_ref_text,
+                        "target_id_from_bib": target_id
+                        # Optional: could add pointer_info["citation_tag_name"], pointer_info["citation_tag_attributes"]
+                    }
+                    resolved_citations.append(citation_data)
+                    logging.info(f"RR: Added resolved link: TargetID='{target_id}', Pointer='{in_text_citation_string}', Context='{context_text_from_parser[:50]}...'")
             else:
                 logging.warning(f"RR: Pointer target_id '{target_id}' for in-text string '{in_text_citation_string}' not found in bib_map.")
                             
-        logging.info(f"RR: resolve_references finished. Total resolved citations: {len(resolved_citations)}")
+        logging.info(f"RR: resolve_references finished. Total resolved links: {len(resolved_citations)}")
         return resolved_citations
