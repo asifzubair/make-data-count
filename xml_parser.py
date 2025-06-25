@@ -112,16 +112,18 @@ class XMLParser:
         """Strategy 2: Attempts to parse the bibliography using the TEI schema."""
         if not self.soup: return {}
         bibliography_map = {}
-        # Ensure tag has a 'name' attribute before calling lower()
-        bib_list = self.soup.find(lambda tag: hasattr(tag, 'name') and tag.name and tag.name.lower() == 'listbibl')
-        if not bib_list: return {}
+        bib_list = self.soup.find('listBibl')
+        if not bib_list:
+            return {}
         
-        references = bib_list.find_all('biblstruct')
+        references = bib_list.find_all('biblStruct')
         for ref in references:
             ref_id = ref.get('xml:id')
             note = ref.find('note', attrs={'type': 'raw_reference'})
-            if ref_id and note and note.string:
-                bibliography_map[ref_id] = re.sub(r'\s+', ' ', note.string).strip()
+            if ref_id and note:
+                raw_ref_text = note.get_text(separator=' ', strip=True)
+                if raw_ref_text:
+                    bibliography_map[ref_id] = re.sub(r'\s+', ' ', raw_ref_text).strip()
         return bibliography_map
 
     def get_bibliography_map(self) -> dict:
@@ -321,20 +323,304 @@ class XMLParser:
         if not self.soup:
             return ""
         
-        text = self.soup.get_text(separator=' ', strip=True)
+        text = ""
+        if self.bibliography_format_used == "jats":
+            text = self._get_full_text_jats()
+        elif self.bibliography_format_used == "tei":
+            text = self._get_full_text_tei()
+        elif self.bibliography_format_used == "wiley":
+            text = self._get_full_text_wiley()
+        elif self.bibliography_format_used == "bioc":
+            text = self._get_full_text_bioc()
+        else:
+            # Fallback for unknown or undetermined format
+            if self.soup:
+                # Basic fallback: try to remove common bibliography sections by tag name
+                temp_soup = BeautifulSoup(str(self.soup), self.parser_used) # Create a copy to manipulate
+                for tag_name in ['ref-list', 'listbibl', 'references', 'bibliography']:
+                    for section in temp_soup.find_all(tag_name):
+                        section.decompose()
+                text = temp_soup.get_text(separator=' ', strip=True)
+            else:
+                text = ""
+
         return ' '.join(text.split())
+
+    def _get_full_text_jats(self) -> str:
+        """Extracts full text for JATS format, excluding ref-list."""
+        if not self.soup: return ""
+
+        body_content = []
+
+        # Primary target: <body> element
+        body_element = self.soup.find('body')
+        if body_element:
+            # Exclude ref-list from body if it's nested
+            for ref_list in body_element.find_all('ref-list', recursive=False): # only top-level within body
+                ref_list.decompose()
+            body_content.append(body_element.get_text(separator=' ', strip=True))
+
+        # Fallback or additional: <article-text>
+        article_text_element = self.soup.find('article-text')
+        if article_text_element:
+            # Exclude ref-list from article-text if it's nested
+            for ref_list in article_text_element.find_all('ref-list', recursive=False):
+                ref_list.decompose()
+            # Avoid double-counting if body was inside article-text and already processed
+            # This is a simple check; real JATS can be complex.
+            # For now, we assume they are mostly separate or body is primary.
+            if not body_element or not body_element.find('article-text'):
+                 body_content.append(article_text_element.get_text(separator=' ', strip=True))
+
+        # If neither body nor article-text found, use root but remove ref-list
+        if not body_content:
+            temp_soup = BeautifulSoup(str(self.soup), self.parser_used)
+            for ref_list in temp_soup.find_all('ref-list'):
+                ref_list.decompose()
+            body_content.append(temp_soup.get_text(separator=' ', strip=True))
+
+        return ' '.join(body_content)
+
+    def _get_full_text_tei(self) -> str:
+        """Extracts full text for TEI format, excluding listBibl."""
+        if not self.soup: return ""
+        text_element = self.soup.find('text')
+        if text_element:
+            # Work on a copy to avoid modifying the original soup
+            temp_text_element = BeautifulSoup(str(text_element), self.parser_used)
+            for list_bibl in temp_text_element.find_all('listbibl'):
+                list_bibl.decompose()
+
+            # Prioritize <body> within <text>
+            body_element = temp_text_element.find('body')
+            if body_element:
+                return body_element.get_text(separator=' ', strip=True)
+            else: # If no <body> in <text>, use all of <text> (with listBibl removed)
+                return temp_text_element.get_text(separator=' ', strip=True)
+        return "" # Fallback if no <text> element
+
+    def _get_full_text_wiley(self) -> str:
+        """Extracts full text for Wiley format, attempting to exclude common bibliography sections."""
+        if not self.soup: return ""
+        # Wiley can be JATS-like or have its own structure.
+        # Start with a copy of the full soup.
+        temp_soup = BeautifulSoup(str(self.soup), self.parser_used)
+
+        # Remove common bibliography sections
+        for ref_list in temp_soup.find_all('ref-list'): # JATS-like
+            ref_list.decompose()
+        for references_sec in temp_soup.find_all('references'): # Common section name
+            references_sec.decompose()
+
+        # Specific Wiley: <bm> (back matter) often contains references.
+        # <component doi=" moléculis-2022-02694-comp001" id="moléculis-2022-02694-comp001" type="references">
+        for component in temp_soup.find_all('component', attrs={'type': 'references'}):
+            component.decompose()
+
+        # Try to find a <body> element
+        body_element = temp_soup.find('body')
+        if body_element:
+            return body_element.get_text(separator=' ', strip=True)
+
+        # If no <body>, return text of the modified soup.
+        # This is a broad fallback for Wiley.
+        return temp_soup.get_text(separator=' ', strip=True)
+
+    def _get_full_text_bioc(self) -> str:
+        """Extracts full text for BioC format from non-reference passages."""
+        if not self.soup: return ""
+
+        text_parts = []
+        passages = self.soup.find_all('passage')
+        for passage in passages:
+            is_reference_passage = False
+            infons = passage.find_all('infon')
+            for infon in infons:
+                key = infon.get('key')
+                # Check against common keys indicating a reference/bibliography section
+                if key in ['section_type', 'type'] and infon.text.strip().upper() in ['REF', 'REFERENCES', 'BIBLIOGRAPHY', 'BIBR']:
+                    is_reference_passage = True
+                    break
+
+            if not is_reference_passage:
+                text_content_tag = passage.find('text')
+                if text_content_tag:
+                    text_parts.append(text_content_tag.get_text(separator=' ', strip=True))
         
-    def find_pointers_in_text(self) -> dict:
-        """Finds all in-text bibliographic pointers and maps their target ID to the citation text."""
+        return ' '.join(text_parts)
+
+    def get_pointer_map(self) -> dict: # Renamed from find_pointers_in_text
+        """
+        Finds all in-text bibliographic pointers and maps their target ID to the citation text.
+        This method is schema-aware.
+        """
         if not self.soup:
             return {}
-            
+
+        if self.bibliography_format_used == "jats":
+            return self._get_pointers_jats()
+        elif self.bibliography_format_used == "tei":
+            return self._get_pointers_tei()
+        elif self.bibliography_format_used == "wiley":
+            return self._get_pointers_wiley()
+        elif self.bibliography_format_used == "bioc":
+            return self._get_pointers_bioc()
+        else:
+            # Fallback for unknown or undetermined format - use the old generic logic
+            return self._get_pointers_generic()
+
+    def _get_pointers_generic(self) -> dict:
+        """Generic pointer extraction, used as a fallback."""
+        if not self.soup: return {}
         pointers_map = {}
-        pointer_tags = self.soup.find_all('ref', attrs={'type': 'bibr'})
-        for tag in pointer_tags:
+        # This is the old logic, primarily JATS-like
+        # Look for <ref type="bibr" target="...">
+        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
             target = tag.get('target')
-            text = tag.get_text(separator=' ', strip=True)
-            if target and text:
+            if target:
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): # If ref tag is empty, use the target ID as text
+                    text = target.lstrip('#') # Use raw target id as text if none exists
                 pointers_map[target.lstrip('#')] = ' '.join(text.split())
+
+        # Also look for <xref ref-type="bibr" rid="..."> which is common in JATS
+        # Removed 'if not pointers_map:' to collect both types
+        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
+            target_id = tag.get('rid')
+            if target_id:
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): text = target_id.lstrip('#') # Fallback text, use raw rid
+                pointers_map[target_id.lstrip('#')] = ' '.join(text.split())
+        return pointers_map
+
+    def _get_pointers_jats(self) -> dict:
+        """Extracts in-text citation pointers for JATS format."""
+        if not self.soup: return {}
+        pointers_map = {}
+        # Prioritize <xref ref-type="bibr" rid="ID">text</xref>
+        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
+            target_id = tag.get('rid')
+            if target_id:
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): # If xref is empty but has rid, use the rid as text like [rid]
+                    text = f"[{target_id.lstrip('#')}]"
+                pointers_map[target_id.lstrip('#')] = ' '.join(text.split())
+
+        # Fallback or alternative: <ref type="bibr" target="#ID">text</ref>
+        # This check is to avoid overwriting if xrefs were already found and are preferred.
+        # However, some documents might use only <ref> for this.
+        # A simple way: if pointers_map is still empty, try the other style.
+        if not pointers_map:
+            for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
+                target = tag.get('target') # JATS often uses target="#id"
+                if target:
+                    text = tag.get_text(separator=' ', strip=True)
+                    if not text.strip(): # If ref tag is empty, use the target ID as text
+                         text = f"[{target.lstrip('#')}]"
+                    pointers_map[target.lstrip('#')] = ' '.join(text.split())
+        return pointers_map
+
+    def _get_pointers_tei(self) -> dict:
+        """Extracts in-text citation pointers for TEI format."""
+        if not self.soup: return {}
+        pointers_map = {}
+        # Look for <ref target="#ID">text</ref>
+        for tag in self.soup.find_all('ref'): # TEI <ref> might not have a 'type'
+            target = tag.get('target')
+            if target and target.startswith('#'): # Ensure it's an internal link
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): # If ref tag is empty, use the target ID as text
+                    text = f"[{target.lstrip('#')}]"
+                pointers_map[target.lstrip('#')] = ' '.join(text.split())
+
+        # Consider <ptr target="#ID"/> (usually for pointers without specific display text)
+        # If no <ref> tags with text were found, or to supplement.
+        # For now, let's assume <ref> with text is primary. If specific cases for <ptr> arise,
+        # we can add logic, e.g. if tag.get_text() is empty.
+        return pointers_map
+
+    def _get_pointers_wiley(self) -> dict:
+        """Extracts in-text citation pointers for Wiley format."""
+        if not self.soup: return {}
+        pointers_map = {}
+        # Wiley can be JATS-like, so try JATS patterns first.
+        # <xref ref-type="bibr" rid="ID">text</xref>
+        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
+            target_id = tag.get('rid')
+            if target_id:
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): text = f"[{target_id.lstrip('#')}]"
+                pointers_map[target_id.lstrip('#')] = ' '.join(text.split())
+
+        # <ref type="bibr" target="#ID">text</ref> (less common in Wiley but possible)
+        # Removed 'if not pointers_map:'
+        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
+            target = tag.get('target')
+            if target and target.startswith('#'):
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): text = f"[{target.lstrip('#')}]"
+                pointers_map[target.lstrip('#')] = ' '.join(text.split())
+
+        # Wiley specific: <citeLink ref="ID">text</citeLink> or similar custom tags
+        # This would require knowledge of Wiley's specific DTDs/schemas, which vary.
+        # For now, we rely on JATS-like patterns which are common.
+        # A more robust Wiley parser would need to inspect actual Wiley XML samples for their pointer styles.
+
+        # Try a generic <ref target="..."> if other specific Wiley patterns didn't catch all.
+        # Removed 'if not pointers_map:'
+        for tag in self.soup.find_all('ref'):
+            # Avoid re-processing if already found by type='bibr'
+            if 'type' in tag.attrs and tag.attrs['type'] == 'bibr':
+                continue
+            target = tag.get('target')
+            # More general heuristic for target IDs (e.g., #w2, #ref2, #bibItem2)
+            if target and target.startswith('#') and re.match(r'#([a-zA-Z0-9\-_.:]+)', target):
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): text = f"[{target.lstrip('#')}]"
+                # Ensure we don't overwrite an existing entry from a more specific rule unless text is better
+                if target.lstrip('#') not in pointers_map or not pointers_map[target.lstrip('#')].startswith('['):
+                    pointers_map[target.lstrip('#')] = ' '.join(text.split())
+        return pointers_map
+
+    def _get_pointers_bioc(self) -> dict:
+        """
+        Extracts in-text citation pointers for BioC format.
+        This is complex as BioC may not have explicit pointer tags.
+        Relies on finding <annotation> elements that are typed as citations
+        and link to a bibliography item.
+        """
+        if not self.soup: return {}
+        pointers_map = {}
+
+        # Ideal case: BioC <annotation> tags for citations
+        # Example structure we're looking for:
+        # <annotation id="A4">
+        #   <infon key="type">citation</infon>
+        #   <infon key="referenced_bib_id">B1</infon> <!-- ID from <listBibl> -->
+        #   <location length="3" offset="202"/>
+        #   <text>[1]</text>
+        # </annotation>
+        for ann_tag in self.soup.find_all('annotation'):
+            is_citation_annotation = False
+            target_id = None
+            text = None
+
+            for infon_tag in ann_tag.find_all('infon'):
+                if infon_tag.get('key') == 'type' and infon_tag.text.lower() in ['citation', 'reference', 'bibr']:
+                    is_citation_annotation = True
+                if infon_tag.get('key') in ['referenced_bib_id', 'target_id', 'rid', 'target']: # Common keys for target
+                    target_id = infon_tag.text.strip().lstrip('#')
+
+            if is_citation_annotation and target_id:
+                text_tag = ann_tag.find('text')
+                if text_tag and text_tag.text.strip():
+                    text = text_tag.text.strip()
+                else: # If no <text> tag or empty, use a placeholder based on target_id
+                    text = f"[{target_id}]"
+
+                pointers_map[target_id] = ' '.join(text.split())
+
+        # If no explicit annotations found, this method won't find pointers for BioC.
+        # Pattern matching (e.g., for "[1]") in text is too unreliable without linking information.
         return pointers_map
 

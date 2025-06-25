@@ -19,6 +19,7 @@ class ReferenceResolver:
         self.bib_map = self.parser.get_bibliography_map()
         self.full_text = self.parser.get_full_text()
         self.sentences = list(self.nlp(self.full_text).sents)
+        self.document_pointers = self.parser.get_pointer_map() # Updated method name
         
         # Pre-compile regex patterns for efficiency
         self._pre_filter_keywords = ['doi', 'accession', 'available', 'deposited', 'database', 'repository', 'dryad', 'zenodo', 'figshare', 'genbank', 'seanoe']
@@ -55,25 +56,28 @@ class ReferenceResolver:
                     "method": "direct_doi"
                 })
 
-            # Find pointer references within the sentence
-            # Use BeautifulSoup to parse just the sentence for <ref> tags
-            sent_soup = BeautifulSoup(sentence_text, 'html.parser')
-            pointer_tags = sent_soup.find_all('ref', attrs={'type': 'bibr'})
-
-            for tag in pointer_tags:
-                target_id = tag.get('target')
-                if target_id:
-                    clean_target_id = target_id.lstrip('#')
-                    full_ref_text = self.bib_map.get(clean_target_id)
+            # New logic for pointer resolution using self.document_pointers
+            for target_id, pointer_text_in_document in self.document_pointers.items():
+                # Check if the specific pointer text (e.g., "[1]", "(Author 2020)") appears in the current sentence
+                if pointer_text_in_document in sentence_text:
+                    full_ref_text = self.bib_map.get(target_id) # target_id is already clean from parser
                     
                     if full_ref_text:
                         # Search for a DOI within the full reference text from the map
                         doi_match_in_ref = self._direct_doi_pattern.search(full_ref_text)
                         if doi_match_in_ref:
-                            resolved_citations.append({
-                                "context": sentence_text,
-                                "id": doi_match_in_ref.group(0),
-                                "method": "pointer_resolution"
-                            })
+                            # Avoid adding duplicate if direct DOI and pointer resolve to same DOI in same sentence
+                            # This is a basic check; more sophisticated duplicate handling might be needed
+                            is_duplicate = False
+                            for res_cit in resolved_citations:
+                                if res_cit["id"] == doi_match_in_ref.group(0) and res_cit["context"] == sentence_text:
+                                    is_duplicate = True
+                                    break
+                            if not is_duplicate:
+                                resolved_citations.append({
+                                    "context": sentence_text,
+                                    "id": doi_match_in_ref.group(0),
+                                    "method": "pointer_resolution"
+                                })
                             
         return resolved_citations
