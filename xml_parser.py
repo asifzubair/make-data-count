@@ -175,37 +175,41 @@ class XMLParser:
         """Strategy 3: Attempts to parse the bibliography using a Wiley XML schema."""
         if not self.soup: return {}
         bibliography_map = {}
+        processed_keys = set()
 
-        # Wiley references are often in <bib> tags with an xml:id
-        # These <bib> tags might be under a general content tag, or a specific "references" section
-        # For now, let's find all <bib> tags directly.
-        # We might need to make this more specific if it picks up unrelated <bib> tags.
-        references = self.soup.find_all('bib')
-
-        if not references:
-            # Sometimes Wiley has a <ref-list> like JATS but with <ref> containing <citation-alternatives> and then the <citation>
-            # This is a bit of a hybrid, let's check for a simple version of this too if direct <bib> fails.
-            ref_list_tag = self.soup.find('ref-list') # Wiley might use 'ref-list'
-            if ref_list_tag:
-                references = ref_list_tag.find_all('ref') # and 'ref' like JATS
-
-        for ref_tag in references: # This could be a <bib> or <ref> tag depending on above
-            key = ref_tag.get('xml:id') or ref_tag.get('id') # Use xml:id first, then id
-
+        # Strategy A: Look for <bib xml:id="..."> tags directly
+        direct_bib_tags = self.soup.find_all('bib')
+        for bib_tag in direct_bib_tags:
+            key = bib_tag.get('xml:id') # Primarily look for xml:id in <bib>
             if key:
-                citation_element = ref_tag.find('citation') # Wiley uses <citation> directly inside <bib> or <ref>
-
-                # Handle cases like <citation-alternatives><citation>...</citation></citation-alternatives>
+                citation_element = bib_tag.find('citation')
                 if not citation_element:
-                    citation_alt_element = ref_tag.find('citation-alternatives')
+                    citation_alt_element = bib_tag.find('citation-alternatives')
                     if citation_alt_element:
                         citation_element = citation_alt_element.find('citation')
 
                 if citation_element:
-                    # Extract text carefully to reconstruct a readable reference string
-                    # This might need more refinement based on Wiley's specific sub-tags within <citation>
                     value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
                     bibliography_map[key] = value
+                    processed_keys.add(key)
+
+        # Strategy B: Look for <ref-list> containing <ref id="...">
+        ref_list_tag = self.soup.find('ref-list')
+        if ref_list_tag:
+            ref_tags_in_list = ref_list_tag.find_all('ref')
+            for ref_tag in ref_tags_in_list:
+                key = ref_tag.get('id') # Primarily look for id in <ref>
+                if key and key not in processed_keys: # Avoid reprocessing if already handled by <bib xml:id>
+                    citation_element = ref_tag.find('citation')
+                    if not citation_element:
+                        citation_alt_element = ref_tag.find('citation-alternatives')
+                        if citation_alt_element:
+                            citation_element = citation_alt_element.find('citation')
+
+                    if citation_element:
+                        value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
+                        bibliography_map[key] = value
+                        processed_keys.add(key)
 
         if bibliography_map:
             logging.info(f"Parsed bibliography using Wiley strategy for {self.xml_path}")
@@ -446,7 +450,7 @@ class XMLParser:
                 text_content_tag = passage.find('text')
                 if text_content_tag:
                     text_parts.append(text_content_tag.get_text(separator=' ', strip=True))
-        
+
         return ' '.join(text_parts)
 
     def get_pointer_map(self) -> dict: # Renamed from find_pointers_in_text
@@ -561,13 +565,22 @@ class XMLParser:
                 if not text.strip(): text = f"[{target.lstrip('#')}]"
                 pointers_map[target.lstrip('#')] = ' '.join(text.split())
 
-        # Wiley specific: <citeLink ref="ID">text</citeLink> or similar custom tags
+        # Attempt 3: Wiley-specific <link href="#ID">text</link>
+        for tag in self.soup.find_all('link'): # Find all <link> tags
+            target_href = tag.get('href')
+            if target_href and target_href.startswith('#'): # Check for internal href
+                target_id = target_href.lstrip('#')
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): text = f"[{target_id}]" # Default text if link tag is empty
+
+                # Add if not already found by a more specific rule, or if this text is better
+                if target_id not in pointers_map or pointers_map[target_id].startswith('['):
+                    pointers_map[target_id] = ' '.join(text.split())
+
+        # Attempt 4: Generic <ref target="..."> (fallback)
         # This would require knowledge of Wiley's specific DTDs/schemas, which vary.
         # For now, we rely on JATS-like patterns which are common.
         # A more robust Wiley parser would need to inspect actual Wiley XML samples for their pointer styles.
-
-        # Try a generic <ref target="..."> if other specific Wiley patterns didn't catch all.
-        # Removed 'if not pointers_map:'
         for tag in self.soup.find_all('ref'):
             # Avoid re-processing if already found by type='bibr'
             if 'type' in tag.attrs and tag.attrs['type'] == 'bibr':
@@ -575,11 +588,12 @@ class XMLParser:
             target = tag.get('target')
             # More general heuristic for target IDs (e.g., #w2, #ref2, #bibItem2)
             if target and target.startswith('#') and re.match(r'#([a-zA-Z0-9\-_.:]+)', target):
+                target_id = target.lstrip('#') # Ensure we use target_id consistently
                 text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): text = f"[{target.lstrip('#')}]"
+                if not text.strip(): text = f"[{target_id}]"
                 # Ensure we don't overwrite an existing entry from a more specific rule unless text is better
-                if target.lstrip('#') not in pointers_map or not pointers_map[target.lstrip('#')].startswith('['):
-                    pointers_map[target.lstrip('#')] = ' '.join(text.split())
+                if target_id not in pointers_map or pointers_map[target_id].startswith('['):
+                    pointers_map[target_id] = ' '.join(text.split())
         return pointers_map
 
     def _get_pointers_bioc(self) -> dict:

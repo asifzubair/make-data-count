@@ -111,55 +111,67 @@ class TestXMLParser(unittest.TestCase):
         self.assertEqual(pointer_map["ref3"], "[ref3]") # Default text for empty ref
         self.assertEqual(len(pointer_map), 3)
 
-    def test_wiley_parsing_jats_like(self):
+    def test_wiley_parsing_jats_like(self): # Renaming to test_wiley_parsing
+        # This sample now includes <link href="..."> and also <bib xml:id> for bib parsing
         xml_content = """<?xml version="1.0"?>
         <article xmlns:xlink="http://www.w3.org/1999/xlink">
             <body>
-                <p>Wiley body text <xref ref-type="bibr" rid="w1">[WileyRef1]</xref>.</p>
-                <p>Another pointer <ref target="#w2">(Wiley 2022)</ref>.</p>
+                <p>Wiley body text with a JATS-style xref <xref ref-type="bibr" rid="w1">[WileyRef1]</xref>.</p>
+                <p>Another pointer using a generic ref <ref target="#w2">(Wiley 2022)</ref>.</p>
+                <p>And a link style pointer (Author, <link href="#w3">2023</link>).</p>
+                <p>An empty link pointer <link href="#w4"/>.</p>
             </body>
             <back>
                 <ref-list>
-                    <ref id="w1"><citation>Wiley reference content 1.</citation></ref>
-                    <ref id="w2"><citation>Wiley reference content 2.</citation></ref>
+                    <title>References</title>
+                    <ref id="w1"><citation>Wiley reference content 1 via ref id.</citation></ref>
+                    <ref id="w2"><citation>Wiley reference content 2 via ref id.</citation></ref>
+                    <bib xml:id="w3"><label>W3</label><citation>Wiley reference content 3 for link via bib xml:id.</citation></bib>
+                    <bib xml:id="w4"><label>W4</label><citation>Wiley reference content 4 for empty link.</citation></bib>
                 </ref-list>
             </back>
         </article>
         """
         parser = self._write_xml_and_parse(xml_content)
         self.assertTrue(parser.soup is not None, "Soup object should not be None")
-        # This structure is very JATS-like, so it's possible JATS bib parser picks it up first.
-        # For testing Wiley-specific text/pointer, we need to ensure Wiley path is taken.
-        # If bib parsing identifies it as 'jats', the Wiley-specific path in get_full_text/get_pointer_map won't run.
-        # This test assumes that the bibliography parsing correctly identifies it as "wiley",
-        # or that the "jats" path for full_text/pointers is compatible.
-        # For a more direct test of Wiley logic, one might need a structure less ambiguous with JATS.
-        # Let's assume for this test that 'wiley' or 'jats' are acceptable for bib format,
-        # and the pointer/text extraction should work robustly.
 
-        # If `_parse_bib_wiley` is intended to catch this before `_parse_bib_jats`, it should be "wiley".
-        # If JATS is first and catches it, then that's also a valid parse path.
-        # The key is that the output is correct.
-        # Forcing for this test to ensure Wiley code paths are tested if JATS takes precedence:
-        # if parser.bibliography_format_used == "jats":
-        #     parser.bibliography_format_used = "wiley" # Force Wiley path for text/pointer extraction logic
-        # Relying on natural detection order now. _parse_bib_wiley should detect this sample.
-        parser.get_bibliography_map() # Ensure bib format detection is triggered
-        self.assertEqual(parser.bibliography_format_used, "wiley", f"Wiley format not detected for bib. Detected: {parser.bibliography_format_used}")
+        bib_map = parser.get_bibliography_map()
+        # _parse_bib_wiley should handle <ref id="..."><citation> and also <bib xml:id="..."><citation>
+        self.assertEqual(parser.bibliography_format_used, "wiley", f"Wiley format not detected for bib. Detected: {parser.bibliography_format_used}. BibMap: {bib_map}")
+
+        self.assertIn("w1", bib_map)
+        self.assertIn("w2", bib_map)
+        self.assertIn("w3", bib_map)
+        self.assertIn("w4", bib_map)
+        self.assertIn("Wiley reference content 1 via ref id", bib_map["w1"])
+        self.assertIn("Wiley reference content 3 for link via bib xml:id", bib_map["w3"])
+
 
         full_text = parser.get_full_text()
         self.assertIn("Wiley body text", full_text)
+        self.assertIn("[WileyRef1]", full_text)
+        self.assertIn("(Wiley 2022)", full_text)
+        self.assertIn("Author, 2023", full_text) # Check text around the link pointer
+        self.assertIn("An empty link pointer", full_text)
         self.assertNotIn("Wiley reference content 1", full_text)
+        self.assertNotIn("Wiley reference content 3 for link", full_text)
+        self.assertNotIn("References", full_text) # Title of ref-list
+
 
         pointer_map = parser.get_pointer_map()
-        # Wiley pointer logic tries JATS <xref> first
-        self.assertIn("w1", pointer_map, f"Pointer map: {pointer_map}")
+        self.assertEqual(len(pointer_map), 4, f"Expected 4 pointers, found {len(pointer_map)}. Map: {pointer_map}")
+
+        self.assertIn("w1", pointer_map) # Caught by <xref>
         self.assertEqual(pointer_map["w1"], "[WileyRef1]")
-        # Then it tries <ref target="..."> with heuristic
-        self.assertIn("w2", pointer_map, f"Pointer map: {pointer_map}") # This will fail if heuristic is too strict
+
+        self.assertIn("w2", pointer_map) # Caught by generic <ref target>
         self.assertEqual(pointer_map["w2"], "(Wiley 2022)")
 
-        self.assertEqual(len(pointer_map), 2)
+        self.assertIn("w3", pointer_map) # Caught by new <link href> logic
+        self.assertEqual(pointer_map["w3"], "2023")
+
+        self.assertIn("w4", pointer_map) # Caught by new <link href> logic with default text
+        self.assertEqual(pointer_map["w4"], "[w4]")
 
 
     def test_bioc_parsing(self):
