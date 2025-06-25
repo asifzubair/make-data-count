@@ -22,31 +22,42 @@ jats_parser = XMLParser(JATS_ARTICLE_PATH)
 jats_resolver = ReferenceResolver(jats_parser, nlp)
 jats_results = jats_resolver.resolve_references()
 
+# Expected fields in each result dictionary
+EXPECTED_FIELDS = {"doi", "context_sentence", "in_text_citation_string", "bibliography_entry_text", "target_id_from_bib"}
+
 if jats_results:
-    print(f"SUCCESS: Found {len(jats_results)} potential references for JATS file.")
-    print("Sample of resolved references:")
+    print(f"Found {len(jats_results)} resolved references for JATS file (sample_jats.xml).")
     pprint(jats_results[:3])
-    assert len(jats_results) > 0, "Expected to find references in JATS file"
+    assert len(jats_results) == 1, f"Expected 1 resolved reference from JATS sample, got {len(jats_results)}"
+    for result in jats_results:
+        assert EXPECTED_FIELDS.issubset(result.keys()), f"JATS result missing expected fields: {result}"
+        assert "method" not in result, "JATS result should not contain 'method' field"
+        # Specific check for the expected JATS pointer resolution
+        if result["target_id_from_bib"] == "r1":
+            assert result["doi"] == "10.5678/ref.jats.", "Incorrect DOI for JATS pointer r1"
+            assert result["in_text_citation_string"] == "[1]", "Incorrect in_text_citation_string for JATS pointer r1"
 else:
-    print("No references found in JATS file.")
-    # Depending on expectations, this could be an assertion failure too
-    # For now, let's assume some files might legitimately have no refs,
-    # but for these specific test files, we expect them.
-    assert False, "Expected to find references in JATS file, but none were found."
+    print("No references found in JATS file (sample_jats.xml).")
+    assert False, "Expected 1 resolved reference from JATS sample, but none were found."
 
 
 # --- Test 2: The TEI file ---
 print(f"\n--- Testing ReferenceResolver on TEI file: {TEI_ARTICLE_FILENAME} ---")
-tei_parser = XMLParser(TEI_ARTICLE_PATH) # Ensure this path is correct for your environment
+tei_parser = XMLParser(TEI_ARTICLE_PATH)
 tei_resolver = ReferenceResolver(tei_parser, nlp)
 tei_results = tei_resolver.resolve_references()
 
 if tei_results:
-    print(f"SUCCESS: Found {len(tei_results)} potential references for TEI file.")
-    print("Sample of resolved references:")
+    print(f"Found {len(tei_results)} resolved references for TEI file (sample_tei.xml).")
     pprint(tei_results[:3])
-    assert len(tei_results) > 0, "Expected to find references in TEI file"
+    assert len(tei_results) == 1, f"Expected 1 resolved reference from TEI sample, got {len(tei_results)}"
+    for result in tei_results:
+        assert EXPECTED_FIELDS.issubset(result.keys()), f"TEI result missing expected fields: {result}"
+        assert "method" not in result, "TEI result should not contain 'method' field"
+        # Specific check for the expected TEI pointer resolution
+        if result["target_id_from_bib"] == "tei_ref1":
+            assert result["doi"] == "10.9999/tei.ref.doi.", "Incorrect DOI for TEI pointer tei_ref1"
+            assert result["in_text_citation_string"] == "(Author, 2023)", "Incorrect in_text_citation_string for TEI pointer tei_ref1"
 else:
-    print("No references found in TEI file.")
-    # Similar to JATS, for this specific test file, we expect references.
-    assert False, "Expected to find references in TEI file, but none were found."
+    print("No references found in TEI file (sample_tei.xml).")
+    assert False, "Expected 1 resolved reference from TEI sample, but none were found."
