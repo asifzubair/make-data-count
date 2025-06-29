@@ -1,14 +1,411 @@
 import re
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Doctype
 import os
 from pprint import pprint
-from tqdm import tqdm
+from tqdm import tqdm # Should be used by the calling script if looping, not by parser itself
 import logging
+from abc import ABC, abstractmethod
+import copy # Added for deepcopy
 
 # Configure basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(module)s - %(funcName)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# --- The XMLParser Class ---
+# --- Abstract Base Class for Specific Parsers ---
+class BaseSpecificXMLParser(ABC):
+    def __init__(self, soup: BeautifulSoup | None, xml_path: str, parser_used_for_soup: str | None):
+        self.soup = soup
+        self.xml_path = xml_path
+        self.parser_used_for_soup = parser_used_for_soup
+        self._bib_map_cache = None
+        self._pointer_map_cache = None # List[dict]
+        self._full_text_cache = None
+        # self._title_cache = None # For future use
+        # self._authors_cache = None # For future use
+
+    @abstractmethod
+    def parse_bibliography(self) -> dict:
+        pass
+
+    @abstractmethod
+    def extract_full_text_excluding_bib(self) -> str:
+        pass
+
+    @abstractmethod
+    def extract_pointers_with_context(self) -> list[dict]:
+        pass
+
+    def _find_contextual_parent_text(self, tag, max_depth=5) -> str:
+        context_parent_tags = ['p', 'div', 'li', 'section', 'article-section', 'body', 'article-body', 'text', 'abstract', 'caption', 'title']
+        current_tag = tag
+        for _ in range(max_depth):
+            parent = current_tag.parent
+            if not parent: break
+            if parent.name and parent.name.lower() in context_parent_tags:
+                return ' '.join(parent.get_text(separator=' ', strip=True).split())
+            current_tag = parent
+        if tag.parent: # Fallback to immediate parent
+            return ' '.join(tag.parent.get_text(separator=' ', strip=True).split())
+        return ' '.join(tag.get_text(separator=' ', strip=True).split()) # Fallback to tag itself if no parent
+
+# --- Concrete Parser Implementations ---
+class JATSParser(BaseSpecificXMLParser):
+    def parse_bibliography(self) -> dict:
+        if not self.soup: return {}
+        bibliography_map = {}
+        ref_list = self.soup.find('ref-list')
+        if not ref_list: return {}
+        references = ref_list.find_all('ref')
+        for ref in references:
+            key = None
+            label_element = ref.find('label')
+            if label_element and label_element.text: key = label_element.text.strip().strip('.')
+            if not key:
+                ref_id = ref.get('id')
+                if ref_id: key = ref_id.strip()
+            if key:
+                citation_element = ref.find('mixed-citation') or ref.find('element-citation')
+                if citation_element:
+                    bibliography_map[key] = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
+        return bibliography_map
+
+    def extract_full_text_excluding_bib(self) -> str:
+        if not self.soup: return ""
+        # Work on a copy of the soup to safely decompose elements
+        temp_soup_for_text = BeautifulSoup(str(self.soup), self.parser_used_for_soup)
+
+        # Remove all ref-list tags first, wherever they might be
+        for ref_list_tag in temp_soup_for_text.find_all('ref-list'):
+            ref_list_tag.decompose()
+
+        body_content_parts = []
+        body_element = temp_soup_for_text.find('body')
+        if body_element:
+            body_content_parts.append(body_element.get_text(separator=' ', strip=True))
+
+        article_text_element = temp_soup_for_text.find('article-text')
+        if article_text_element:
+            # Avoid double-counting if article_text_element is the body or inside it
+            if not body_element or (body_element and not body_element.find(lambda tag: tag == article_text_element)):
+                 body_content_parts.append(article_text_element.get_text(separator=' ', strip=True))
+
+        if not body_content_parts: # If no body or article-text, use root (with front/back potentially removed)
+            front_matter = temp_soup_for_text.find('front')
+            if front_matter: front_matter.decompose()
+            # Back matter decomposition needs to be careful not to remove Data Availability Statements if they are there
+            # For JATS, DAS is often <sec sec-type="data-availability"> or <notes notes-type="data-availability">
+            # These are often children of <back> but not <ref-list>
+            # So, only remove <ref-list> from <back>, not the whole <back>
+            # This is already handled by the global ref-list removal above.
+            body_content_parts.append(temp_soup_for_text.get_text(separator=' ', strip=True))
+
+        return ' '.join(part.strip() for part in body_content_parts if part.strip()).strip()
+
+    def extract_pointers_with_context(self) -> list[dict]:
+        if not self.soup: return []
+        pointers_list = []
+        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
+            target_id = tag.get('rid')
+            if target_id:
+                text = tag.get_text(separator=' ', strip=True)
+                if not text.strip(): text = f"[{target_id.lstrip('#')}]"
+                context_text = self._find_contextual_parent_text(tag)
+                pointers_list.append({
+                    "target_id": target_id.lstrip('#'), "in_text_citation_string": ' '.join(text.split()),
+                    "context_text": context_text, "citation_tag_name": tag.name, "citation_tag_attributes": tag.attrs
+                })
+        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}): # Fallback
+            target = tag.get('target')
+            if target:
+                target_id = target.lstrip('#')
+                if not any(p['target_id'] == target_id and p['citation_tag_name'] == 'xref' for p in pointers_list):
+                    text = tag.get_text(separator=' ', strip=True)
+                    if not text.strip(): text = f"[{target_id}]"
+                    context_text = self._find_contextual_parent_text(tag)
+                    pointers_list.append({
+                        "target_id": target_id, "in_text_citation_string": ' '.join(text.split()),
+                        "context_text": context_text, "citation_tag_name": tag.name, "citation_tag_attributes": tag.attrs
+                    })
+        return pointers_list
+
+class TEIParser(BaseSpecificXMLParser):
+    def parse_bibliography(self) -> dict:
+        if not self.soup: return {}
+        bibliography_map = {}
+        bib_list = self.soup.find('listBibl')
+        if not bib_list: return {}
+        references = bib_list.find_all('biblStruct')
+        for ref in references:
+            ref_id = ref.get('xml:id')
+            note = ref.find('note', attrs={'type': 'raw_reference'})
+            if ref_id and note:
+                raw_ref_text = note.get_text(separator=' ', strip=True)
+                if raw_ref_text: bibliography_map[ref_id] = re.sub(r'\s+', ' ', raw_ref_text).strip()
+        return bibliography_map
+
+    def extract_full_text_excluding_bib(self) -> str:
+        if not self.soup: return ""
+        text_element = self.soup.find('text')
+        if text_element:
+            temp_text_element = BeautifulSoup(str(text_element), self.parser_used_for_soup)
+            for list_bibl_tag in temp_text_element.find_all('listBibl'): list_bibl_tag.decompose()
+            body_element = temp_text_element.find('body')
+            if body_element: return ' '.join(body_element.get_text(separator=' ', strip=True).split())
+            return ' '.join(temp_text_element.get_text(separator=' ', strip=True).split())
+        return ""
+
+    def extract_pointers_with_context(self) -> list[dict]:
+        if not self.soup: return []
+        pointers_list = []
+        for tag_name in ['ref', 'ptr']: # Check both <ref> and <ptr>
+            for tag in self.soup.find_all(tag_name):
+                target = tag.get('target')
+                if target and target.startswith('#'):
+                    target_id = target.lstrip('#')
+                    # Avoid adding duplicate if ref already processed this target_id for ptr
+                    if tag_name == 'ptr' and any(p['target_id'] == target_id for p in pointers_list): continue
+
+                    text = tag.get_text(separator=' ', strip=True)
+                    if not text.strip(): text = f"[{target_id}]"
+                    context_text = self._find_contextual_parent_text(tag)
+                    pointers_list.append({
+                        "target_id": target_id, "in_text_citation_string": ' '.join(text.split()),
+                        "context_text": context_text, "citation_tag_name": tag.name, "citation_tag_attributes": tag.attrs
+                    })
+        return pointers_list
+
+class WileyParser(BaseSpecificXMLParser):
+    def parse_bibliography(self) -> dict:
+        if not self.soup: return {}
+        bibliography_map = {}
+        processed_keys = set()
+        direct_bib_tags = self.soup.find_all('bib')
+        for bib_tag in direct_bib_tags:
+            key = bib_tag.get('xml:id')
+            if key:
+                citation_element = bib_tag.find('citation') or bib_tag.find('citation-alternatives') and bib_tag.find('citation-alternatives').find('citation')
+                if citation_element:
+                    bibliography_map[key] = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
+                    processed_keys.add(key)
+        ref_list_tag = self.soup.find('ref-list')
+        if ref_list_tag:
+            for ref_tag in ref_list_tag.find_all('ref'):
+                key = ref_tag.get('id')
+                if key and key not in processed_keys:
+                    citation_element = ref_tag.find('citation') or ref_tag.find('citation-alternatives') and ref_tag.find('citation-alternatives').find('citation')
+                    if citation_element:
+                        bibliography_map[key] = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
+        if bibliography_map: logger.info(f"WileyParser: Parsed bibliography for {self.xml_path}")
+        return bibliography_map
+
+    def extract_full_text_excluding_bib(self) -> str:
+        if not self.soup: return ""
+        temp_soup = BeautifulSoup(str(self.soup), self.parser_used_for_soup)
+        for section in temp_soup.find_all(['ref-list', 'references', 'ce:bibliography', 'bibliography']): section.decompose()
+        for component in temp_soup.find_all('component', attrs={'type': 'references'}): component.decompose()
+        body_element = temp_soup.find('body')
+        if body_element: return ' '.join(body_element.get_text(separator=' ', strip=True).split())
+        return ' '.join(temp_soup.get_text(separator=' ', strip=True).split())
+
+    def extract_pointers_with_context(self) -> list[dict]:
+        if not self.soup: return []
+        pointers_list = []
+        def _add_pointer(tag, target_attr_name, id_prefix=''):
+            target_val = tag.get(target_attr_name)
+            if target_val and (id_prefix == '' or target_val.startswith(id_prefix)):
+                target_id = target_val.lstrip(id_prefix)
+                text_content = tag.get_text(separator=' ', strip=True)
+                if not text_content.strip(): text_content = f"[{target_id}]"
+                context_text = self._find_contextual_parent_text(tag)
+                pointers_list.append({
+                    "target_id": target_id, "in_text_citation_string": ' '.join(text_content.split()),
+                    "context_text": context_text, "citation_tag_name": tag.name, "citation_tag_attributes": tag.attrs
+                })
+        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}): _add_pointer(tag, 'rid')
+        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}): _add_pointer(tag, 'target', '#')
+        for tag in self.soup.find_all('link'): _add_pointer(tag, 'href', '#')
+
+        # Fallback for generic <ref target="..."> not already caught
+        processed_targets = {p['target_id'] for p in pointers_list if p['citation_tag_name'] == 'ref'}
+        for tag in self.soup.find_all('ref'):
+            if tag.attrs.get('type') == 'bibr': continue
+            target = tag.get('target')
+            if target and target.startswith('#') and re.match(r'#([a-zA-Z0-9\-_.:]+)', target):
+                if target.lstrip('#') not in processed_targets:
+                     _add_pointer(tag, 'target', '#')
+        return pointers_list
+
+class BioCParser(BaseSpecificXMLParser):
+    def parse_bibliography(self) -> dict:
+        if not self.soup: return {}
+        bibliography_map = {}
+        passages = self.soup.find_all('passage')
+        ref_counter = 0
+        for passage in passages:
+            is_reference_passage = False; passage_infons = {}
+            for infon in passage.find_all('infon'):
+                key = infon.get('key')
+                if key:
+                    passage_infons[key] = infon.text.strip()
+                    if key == 'section_type' and infon.text.strip().upper() == 'REF': is_reference_passage = True
+            if is_reference_passage:
+                text_content_str = ' '.join(passage.find('text').get_text(separator=' ', strip=True).split()) if passage.find('text') else ""
+                source = passage_infons.get('source', '')
+                if not source and text_content_str.lower().startswith("see ref") and len(passage_infons) < 3: continue
+                # ... (rest of BioC bib parsing logic as before) ...
+                ref_parts = []
+                authors = passage_infons.get('authors_str'); title = passage_infons.get('title', ''); year = passage_infons.get('year')
+                fpage = passage_infons.get('fpage'); lpage = passage_infons.get('lpage')
+                if authors: ref_parts.append(authors)
+                if title: ref_parts.append(title)
+                if source: ref_parts.append(f"Source: {source}")
+                if year: ref_parts.append(f"Year: {year}")
+                if fpage and lpage: ref_parts.append(f"pp. {fpage}-{lpage}")
+                elif fpage: ref_parts.append(f"p. {fpage}")
+                # Simplified text_content_str addition
+                if text_content_str and not any(text_content_str in part for part in ref_parts if part) and \
+                   not any(val_info == text_content_str for val_info in passage_infons.values() if val_info):
+                     ref_parts.append(text_content_str)
+
+                if not ref_parts and not source and not title and not year : continue
+                ref_string = ". ".join(filter(None, ref_parts))
+                if not ref_string.strip(): continue
+
+                common_bib_titles_to_skip = ["references", "bibliography", "literature cited", "reference list"]
+                if ref_string.strip().lower() in common_bib_titles_to_skip and \
+                   not (passage_infons.get('source') or passage_infons.get('year') or passage_infons.get('fpage') or passage_infons.get('authors_str')):
+                    logger.info(f"BioCParser: Skipping likely section title: '{ref_string}' in {self.xml_path}")
+                    continue
+                ref_counter += 1; bibliography_map[str(ref_counter)] = ref_string
+        if bibliography_map: logger.info(f"BioCParser: Parsed bibliography for {self.xml_path} (found {len(bibliography_map)} refs)")
+        return bibliography_map
+
+    def extract_full_text_excluding_bib(self) -> str:
+        if not self.soup: return ""
+        text_parts = []
+        for passage in self.soup.find_all('passage'):
+            is_ref_passage = any(
+                infon.get('key') in ['section_type', 'type'] and infon.text.strip().upper() in ['REF', 'REFERENCES', 'BIBLIOGRAPHY', 'BIBR']
+                for infon in passage.find_all('infon')
+            )
+            if not is_ref_passage and passage.find('text'):
+                text_parts.append(passage.find('text').get_text(separator=' ', strip=True))
+        return ' '.join(text_parts)
+
+    def extract_pointers_with_context(self) -> list[dict]:
+        if not self.soup: return []
+        pointers_list = []
+        for ann_tag in self.soup.find_all('annotation'):
+            is_citation_annotation = False; target_id_from_infon = None; in_text_citation_string = None
+            infons = ann_tag.find_all('infon')
+            temp_attrs = {infon.get('key'): infon.text for infon in infons if infon.get('key')}
+            for infon_tag in infons:
+                key_attr = infon_tag.get('key')
+                if key_attr == 'type' and infon_tag.text.lower() in ['citation', 'reference', 'bibr', 'ref']: is_citation_annotation = True
+                if key_attr in ['referenced_bib_id', 'target_bib_id', 'targetid', 'rid', 'target_id', 'target']:
+                    target_id_from_infon = infon_tag.text.strip().lstrip('#')
+            if is_citation_annotation and target_id_from_infon:
+                text_tag = ann_tag.find('text')
+                in_text_citation_string = text_tag.text.strip() if text_tag and text_tag.text.strip() else f"[{target_id_from_infon}]"
+                context_text = self._find_contextual_parent_text(ann_tag)
+                pointers_list.append({
+                    "target_id": target_id_from_infon, "in_text_citation_string": ' '.join(in_text_citation_string.split()),
+                    "context_text": context_text, "citation_tag_name": ann_tag.name, "citation_tag_attributes": temp_attrs
+                })
+        return pointers_list
+
+class GenericFallbackParser(BaseSpecificXMLParser):
+    def parse_bibliography(self) -> dict:
+        # Tries a sequence of bib parsing strategies.
+        # This is effectively what the main XMLParser.get_bibliography_map used to do as its fallback.
+        # Order: JATS, TEI, Wiley, BioC
+        # This avoids re-implementing all _parse_bib_* methods here or making them static.
+        # It creates temporary specific parser instances to attempt parsing.
+        if not self.soup: return {}
+
+        parsers_to_try = [JATSParser, TEIParser, WileyParser, BioCParser]
+        bib_map = {}
+        for parser_class in parsers_to_try:
+            # logger.debug(f"GenericFallbackParser: Trying {parser_class.__name__} for bib parsing on {self.xml_path}")
+            # We need to pass the soup and other details from the *GenericFallbackParser* instance
+            temp_parser = parser_class(self.soup, self.xml_path, self.parser_used_for_soup)
+            bib_map = temp_parser.parse_bibliography()
+            if bib_map:
+                # If a specific parser succeeds, we could assume its type for `bibliography_format_used`
+                # This interaction needs to be handled carefully in the main XMLParser class.
+                # For now, this method just returns the bib_map. The main XMLParser sets bibliography_format_used.
+                logger.info(f"GenericFallbackParser: Bib parsing for {self.xml_path} succeeded using {parser_class.__name__} rules.")
+                return bib_map
+
+        logger.warning(f"GenericFallbackParser: No bibliography found using any specific strategy for {self.xml_path}")
+        return {}
+
+    def extract_full_text_excluding_bib(self) -> str:
+        if not self.soup: return ""
+        logger.info(f"GenericFallbackParser: Using generic fallback text extraction for {self.xml_path}")
+        if not self.parser_used_for_soup: # Should be set if soup exists
+            logging.warning(f"GenericFallbackParser: self.parser_used_for_soup is None for {self.xml_path}. Defaulting to lxml-xml for temp_soup.")
+            # This situation implies an issue in XMLParser.__init__ not setting parser_used_for_soup when soup is valid.
+            # However, to prevent crash here, we can default, though it might hide the root cause.
+            # A better fix would be to ensure parser_used_for_soup is always set if self.soup is not None.
+            # For now, this is a defensive measure.
+            effective_parser = 'lxml-xml'
+        else:
+            effective_parser = self.parser_used_for_soup # Not strictly needed if using deepcopy directly on self.soup
+
+        # temp_soup = BeautifulSoup(str(self.soup), effective_parser)
+        if not self.soup: return "" # Should be caught by __init__ but defensive
+        temp_soup = copy.deepcopy(self.soup) # Use deepcopy
+
+        tags_to_remove_lower = [t.lower() for t in ['ref-list', 'listbibl', 'references', 'bibliography', 'back', 'notes', 'fn-group']]
+
+        # Iterate over all tags and decompose if name matches (case-insensitive)
+        # This is more exhaustive than relying on find_all with regex if that was failing.
+        temp_soup = copy.deepcopy(self.soup)
+
+        temp_soup = copy.deepcopy(self.soup)
+
+        tags_to_remove_lower = [t.lower() for t in ['ref-list', 'listbibl', 'references', 'bibliography', 'back', 'notes', 'fn-group']]
+        decomposed_count = 0
+
+        # Iterate over a list of tags to avoid issues with modifying the tree while iterating
+        tags_found_to_decompose = []
+        for tag in temp_soup.find_all(True): # Find all tags
+            if tag.name and tag.name.lower() in tags_to_remove_lower:
+                tags_found_to_decompose.append(tag)
+
+        if tags_found_to_decompose:
+            logger.info(f"GenericFallbackParser: Found {len(tags_found_to_decompose)} tags for decomposition: {[t.name for t in tags_found_to_decompose]} in {self.xml_path}")
+            for tag_to_decompose in tags_found_to_decompose:
+                tag_to_decompose.decompose()
+                decomposed_count += 1
+        else:
+            logger.debug(f"GenericFallbackParser: No tags matched for decomposition in {self.xml_path}")
+
+        return ' '.join(temp_soup.get_text(separator=' ', strip=True).split())
+
+    def extract_pointers_with_context(self) -> list[dict]:
+        if not self.soup: return []
+        pointers_list = []
+        for tag_type, id_attr, id_prefix in [
+            (('ref', {'type': 'bibr'}), 'target', '#'),
+            (('xref', {'ref-type': 'bibr'}), 'rid', '')
+        ]:
+            find_args, find_kwargs = (tag_type[0], tag_type[1]) if isinstance(tag_type, tuple) else (tag_type, {})
+            for tag in self.soup.find_all(find_args, **find_kwargs):
+                target_val = tag.get(id_attr)
+                if target_val:
+                    target_id = target_val.lstrip(id_prefix)
+                    text = tag.get_text(separator=' ', strip=True)
+                    if not text.strip(): text = f"[{target_id}]"
+                    context_text = self._find_contextual_parent_text(tag)
+                    pointers_list.append({
+                        "target_id": target_id, "in_text_citation_string": ' '.join(text.split()),
+                        "context_text": context_text, "citation_tag_name": tag.name, "citation_tag_attributes": tag.attrs
+                    })
+        return pointers_list
+
+# --- The XMLParser Class (Facade/Factory) ---
 # This class encapsulates all parsing logic for a single XML file.
 
 class XMLParser:
@@ -17,853 +414,381 @@ class XMLParser:
     It initializes with a file path and provides methods to extract key components.
     """
     def __init__(self, xml_path: str):
-        """
-        Initializes the parser by reading and parsing the XML file with BeautifulSoup.
-        Tries 'lxml-xml' first, then falls back to 'html.parser' if 'lxml-xml' fails.
-        """
         self.xml_path = xml_path
         self.soup = None
-        self._bib_map = None # Use for caching the parsed bibliography
-        self.parser_used = None # Stores 'lxml-xml' or 'html.parser'
-        self.bibliography_format_used = None # DEPRECATED by schema_type, but kept for now as bib parsing sets it.
-        self.schema_type = "unknown_or_error" # Initialize schema_type
+        self.parser_used_for_soup = None # Renamed from parser_used for clarity
+        self.bibliography_format_used = None # Set by get_bibliography_map based on successful strategy
+        self.schema_type = "unknown_or_error"
+        self.specific_parser_instance: BaseSpecificXMLParser | None = None
 
         if not os.path.exists(xml_path):
-            logging.warning(f"File not found: {xml_path}")
+            logger.warning(f"File not found: {xml_path}")
             return
 
         try:
-            with open(xml_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # Attempt to parse with 'lxml-xml'
+            with open(xml_path, 'r', encoding='utf-8') as f: content = f.read()
             try:
                 self.soup = BeautifulSoup(content, 'lxml-xml')
-                if self.soup and self.soup.find(): # Check if soup is not empty and has some content
-                    self.parser_used = 'lxml-xml'
-                    logging.info(f"Successfully parsed {xml_path} with lxml-xml")
-                else:
-                    logging.warning(f"lxml-xml produced empty soup for {xml_path}. Trying html.parser.")
-                    self.soup = None # Ensure soup is None if parsing was not truly successful
-            except Exception as e_lxml:
-                logging.warning(f"Failed to parse {xml_path} with lxml-xml ({e_lxml}). Trying html.parser.")
-                self.soup = None
-
-            # If 'lxml-xml' failed or produced empty soup, try 'html.parser'
+                if self.soup and self.soup.find(): self.parser_used_for_soup = 'lxml-xml'
+                else: self.soup = None # Ensure soup is None if parsing was not truly successful
+            except Exception: self.soup = None
             if self.soup is None:
-                try:
-                    self.soup = BeautifulSoup(content, 'html.parser')
-                    if self.soup and self.soup.find(): # Check if soup is not empty
-                        self.parser_used = 'html.parser'
-                        logging.info(f"Successfully parsed {xml_path} with html.parser")
-                    else:
-                        logging.warning(f"html.parser also produced empty soup for {xml_path}.")
-                        self.soup = None # Explicitly set to None
-                except Exception as e_html:
-                    logging.error(f"Failed to parse {xml_path} with html.parser as well ({e_html}).")
-                    self.soup = None
-
-            if self.soup is None:
-                logging.error(f"Could not parse XML file: {xml_path} with any available parser.")
+                self.soup = BeautifulSoup(content, 'html.parser')
+                if self.soup and self.soup.find(): self.parser_used_for_soup = 'html.parser'
+                else: self.soup = None
+            if self.parser_used_for_soup:
+                 logger.info(f"Successfully parsed {xml_path} with {self.parser_used_for_soup}")
+            else:
+                 logger.error(f"Could not parse XML file: {xml_path} with any available BS4 parser.")
+                 return # Essential to return if soup is None
 
         except Exception as e_file:
-            logging.error(f"Error reading file {xml_path}: {e_file}")
-            self.soup = None
+            logger.error(f"Error reading file {xml_path}: {e_file}")
+            return # self.soup remains None
 
         if self.soup:
             self.schema_type = self._detect_schema()
-            # Log the detected schema type from __init__ to make it clearly visible upon instantiation
-            logging.info(f"XMLParser instantiated for {self.xml_path}. Detected schema: {self.schema_type}. BS4 parser: {self.parser_used}")
+            logger.info(f"XMLParser: Initialized for {self.xml_path}. Detected schema: {self.schema_type}. BS4 parser: {self.parser_used_for_soup}")
+
+            parser_args = (self.soup, self.xml_path, self.parser_used_for_soup)
+            if self.schema_type == "jats": self.specific_parser_instance = JATSParser(*parser_args)
+            elif self.schema_type == "tei": self.specific_parser_instance = TEIParser(*parser_args)
+            elif self.schema_type == "wiley": self.specific_parser_instance = WileyParser(*parser_args)
+            elif self.schema_type == "bioc": self.specific_parser_instance = BioCParser(*parser_args)
+            else: # "unknown" or "unknown_or_error" (if soup was valid but schema unknown)
+                logger.warning(f"XMLParser: Using GenericFallbackParser for {self.xml_path} due to schema: {self.schema_type}")
+                self.specific_parser_instance = GenericFallbackParser(*parser_args)
         else:
-            # If soup is None (e.g. file not found, critical parse error), schema_type remains 'unknown_or_error'
-            logging.error(f"XMLParser instantiated for {self.xml_path}, but self.soup is None. Schema detection skipped.")
+            logger.error(f"XMLParser: self.soup is None for {self.xml_path}. Cannot instantiate specific parser.")
+            # self.specific_parser_instance remains None
 
-
-    # Refined _detect_schema method based on discussion:
     def _detect_schema(self) -> str:
         """
-        Detects the XML schema type based on characteristic tags.
-        Order of checks is important to resolve ambiguities.
+        Detects the XML schema type based on characteristic tags and DOCTYPE/namespaces.
+        Order of checks is important.
         """
         if not self.soup:
-            logging.error(f"SCHEMA_DETECT ({self.xml_path}): Soup is None.")
+            # This case should ideally be handled before calling _detect_schema,
+            # as __init__ already checks if self.soup is None.
+            # However, as a safeguard:
+            logger.error(f"SCHEMA_DETECT ({self.xml_path}): Soup is None at detection time.")
             return 'unknown_or_error'
 
-        # BioC check: Look for characteristic passage/infon structure for REF sections
-        passages = self.soup.find_all('passage')
-        is_bioc_candidate_by_structure = self.soup.find('collection') and self.soup.find('document') and passages
-
-        if passages: # Only proceed if passages exist
-            for passage in passages:
-                infons = passage.find_all('infon')
-                for infon in infons:
-                    key = infon.get('key')
-                    if key in ['section_type', 'type'] and infon.text.strip().upper() in ['REF', 'REFERENCES', 'BIBLIOGRAPHY', 'BIBR']:
-                        # Try to avoid misclassifying JATS/Wiley if they use similar infon patterns in weird ways
-                        if not self.soup.find('journal-meta') and not self.soup.find('component', attrs={'type': 'references'}):
-                            logging.info(f"Schema detected for {self.xml_path}: bioc (based on REF passage infon)")
-                            return 'bioc'
-
-        if is_bioc_candidate_by_structure and self.soup.find('infon'): # General BioC structure as fallback
-             # Check again it's not something else more specific that was missed by the REF check
-            if not self.soup.find('journal-meta') and \
-               not self.soup.find('component', attrs={'type': 'references'}) and \
-               not self.soup.find('listBibl') and \
-               not self.soup.find('ref-list'):
-                logging.info(f"Schema detected for {self.xml_path}: bioc (based on general BioC structure: collection/document/passage/infon)")
+        # 1. Check DOCTYPE first
+        doctype_obj = next((item for item in self.soup.contents if isinstance(item, Doctype)), None)
+        if doctype_obj:
+            doctype_str = str(doctype_obj).upper()
+            if "JATS (Z39.96)" in doctype_str:
+                logger.info(f"Schema detected for {self.xml_path}: jats (DOCTYPE JATS (Z39.96))")
+                return 'jats'
+            if "BIOC.DTD" in doctype_str:
+                logger.info(f"Schema detected for {self.xml_path}: bioc (DOCTYPE BioC.dtd)")
                 return 'bioc'
 
-
-        # Wiley check: Look for more unique Wiley identifiers first
-        if self.soup.find('component', attrs={'type': 'references'}):
-            logging.info(f"Schema detected for {self.xml_path}: wiley (based on component type='references')")
-            return 'wiley'
-        if self.soup.find('doi_batch_id'):
-            logging.info(f"Schema detected for {self.xml_path}: wiley (based on doi_batch_id)")
-            return 'wiley'
-
-        # More specific JATS check
-        # Looks for ref-list AND ( (front AND article-meta AND journal-meta) OR article[@article-type] )
-        has_ref_list = self.soup.find('ref-list')
-        has_front_article_meta_journal_meta = self.soup.find('front') and \
-                                              self.soup.find('article-meta') and \
-                                              self.soup.find('journal-meta')
-        has_article_with_type = self.soup.find('article', attrs={'article-type': True})
-
-        if has_ref_list and (has_front_article_meta_journal_meta or has_article_with_type):
-            logging.info(f"Schema detected for {self.xml_path}: jats (based on ref-list and other JATS structural tags)")
-            return 'jats'
-
-        # TEI check
-        if self.soup.find('listBibl') and self.soup.find('teiHeader'):
-            logging.info(f"Schema detected for {self.xml_path}: tei (based on listBibl and teiHeader)")
-            return 'tei'
-
-        # Wiley check for <bib xml:id> if it doesn't look like TEI or strong JATS
-        if self.soup.find('bib', attrs={'xml:id': True}):
-            if not self.soup.find('teiHeader') and not has_front_article_meta_journal_meta and not has_article_with_type:
-                logging.info(f"Schema detected for {self.xml_path}: wiley (based on bib xml:id and not strong TEI/JATS markers)")
+        # 2. Check root element name and namespaces
+        root_element = self.soup.find()
+        if root_element:
+            root_name_lower = root_element.name.lower() if root_element.name else ""
+            root_xmlns = root_element.get('xmlns', '').lower()
+            if root_name_lower == 'tei' and root_xmlns == "http://www.tei-c.org/ns/1.0":
+                logger.info(f"Schema detected for {self.xml_path}: tei (root <tei> with TEI namespace)")
+                return 'tei'
+            wiley_ns = "http://www.wiley.com/namespaces/wiley"
+            if root_xmlns == wiley_ns:
+                 logger.info(f"Schema detected for {self.xml_path}: wiley (root element with Wiley namespace)")
+                 return 'wiley'
+            if self.soup.find(lambda tag: tag.name and tag.name.lower() == 'component' and tag.get('xmlns', '').lower() == wiley_ns):
+                logger.info(f"Schema detected for {self.xml_path}: wiley (<component> with Wiley namespace)")
                 return 'wiley'
 
-        # Fallback for less specific JATS-like (could be simple JATS or JATS-like Wiley)
-        if has_ref_list and self.soup.find('ref'):
-            if ref_list_tag := self.soup.find('ref-list'): # Requires Python 3.8+ for walrus operator
-                first_ref_in_list = ref_list_tag.find('ref')
-                if first_ref_in_list and first_ref_in_list.find('citation'): # Check for Wiley's common <citation> tag
-                    logging.info(f"Schema detected for {self.xml_path}: wiley (JATS-like ref-list with <citation> inside <ref>)")
-                    return 'wiley'
-            logging.info(f"Schema detected for {self.xml_path}: jats (fallback due to ref-list, less specific)")
+        # 3. Fallback to tag-based heuristics
+        # BioC heuristic
+        passages = self.soup.find_all('passage')
+        is_bioc_struct = self.soup.find('collection') and self.soup.find('document') and passages
+        if passages:
+            for passage in passages:
+                for infon in passage.find_all('infon'):
+                    key = infon.get('key')
+                    if key in ['section_type', 'type'] and infon.text.strip().upper() in ['REF', 'REFERENCES', 'BIBLIOGRAPHY', 'BIBR']:
+                        if not (self.soup.find('journal-meta') or self.soup.find('component', attrs={'type': 'references'})):
+                            logger.info(f"Schema detected for {self.xml_path}: bioc (heuristic: REF passage infon)")
+                            return 'bioc'
+        if is_bioc_struct and self.soup.find('infon'):
+            if not (self.soup.find('journal-meta') or self.soup.find('component', attrs={'type': 'references'}) or \
+                    self.soup.find('listBibl') or self.soup.find('ref-list')):
+                logger.info(f"Schema detected for {self.xml_path}: bioc (heuristic: general BioC structure)")
+                return 'bioc'
+        # Wiley heuristic
+        if self.soup.find('component', attrs={'type': 'references'}):
+            logger.info(f"Schema detected for {self.xml_path}: wiley (heuristic: component type='references')")
+            return 'wiley'
+        if self.soup.find('doi_batch_id'):
+            logger.info(f"Schema detected for {self.xml_path}: wiley (heuristic: doi_batch_id)")
+            return 'wiley'
+        # JATS heuristic
+        has_ref_list = self.soup.find('ref-list')
+        has_structural_jats = (self.soup.find('front') and self.soup.find('article-meta') and self.soup.find('journal-meta')) or \
+                              self.soup.find('article', attrs={'article-type': True})
+        if has_ref_list and has_structural_jats:
+            logger.info(f"Schema detected for {self.xml_path}: jats (heuristic: ref-list and JATS structural tags)")
             return 'jats'
-
-        logging.warning(f"XML schema not confidently detected for {self.xml_path} using tag heuristics. Defaulting to 'unknown'.")
+        # TEI heuristic
+        if self.soup.find('listBibl') and self.soup.find('teiHeader'):
+            logger.info(f"Schema detected for {self.xml_path}: tei (heuristic: listBibl and teiHeader)")
+            return 'tei'
+        # Wiley <bib xml:id> heuristic
+        if self.soup.find('bib', attrs={'xml:id': True}):
+            if not (self.soup.find('teiHeader') or has_structural_jats):
+                logger.info(f"Schema detected for {self.xml_path}: wiley (heuristic: bib xml:id and not strong TEI/JATS)")
+                return 'wiley'
+        # JATS-like Wiley or simple JATS fallback
+        if has_ref_list and self.soup.find('ref'):
+            ref_list_tag = self.soup.find('ref-list')
+            if ref_list_tag and (first_ref := ref_list_tag.find('ref')) and first_ref.find('citation'):
+                logger.info(f"Schema detected for {self.xml_path}: wiley (heuristic: JATS-like ref-list with <citation>)")
+                return 'wiley'
+            logger.info(f"Schema detected for {self.xml_path}: jats (heuristic fallback: ref-list and ref tags)")
+            return 'jats'
+        logger.warning(f"XML schema not confidently detected for {self.xml_path}. Defaulting to 'unknown'.")
         return 'unknown'
 
-    def _parse_bib_jats(self) -> dict:
-        """Strategy 1: Attempts to parse the bibliography using the JATS schema."""
-        if not self.soup: return {}
-        bibliography_map = {}
-        ref_list = self.soup.find('ref-list')
-        if not ref_list: return {}
-        
-        references = ref_list.find_all('ref')
-        for ref in references:
-            key = None
-            # Try to get key from <label> element first
-            label_element = ref.find('label')
-            if label_element and label_element.text:
-                key = label_element.text.strip().strip('.')
-
-            # If no <label>, try to get key from 'id' attribute of the <ref> tag
-            if not key:
-                ref_id = ref.get('id')
-                if ref_id:
-                    key = ref_id.strip()
-
-            if key:
-                # Try 'mixed-citation' first
-                citation_element = ref.find('mixed-citation')
-                # If not found, try 'element-citation'
-                if not citation_element:
-                    citation_element = ref.find('element-citation')
-
-                if citation_element:
-                    value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
-                    bibliography_map[key] = value
-                # Optional: Add a log if a key was found but no citation element
-                # else:
-                #    logging.debug(f"Found key '{key}' but no citation element in {self.xml_path}")
-            # Optional: Add a log if no key could be determined for a reference
-            # else:
-            #    logging.debug(f"Could not determine key for a <ref> tag in {self.xml_path}")
-        return bibliography_map
-
-    def _parse_bib_tei(self) -> dict:
-        """Strategy 2: Attempts to parse the bibliography using the TEI schema."""
-        if not self.soup: return {}
-        bibliography_map = {}
-        bib_list = self.soup.find('listBibl')
-        if not bib_list:
-            return {}
-        
-        references = bib_list.find_all('biblStruct')
-        for ref in references:
-            ref_id = ref.get('xml:id')
-            note = ref.find('note', attrs={'type': 'raw_reference'})
-            if ref_id and note:
-                raw_ref_text = note.get_text(separator=' ', strip=True)
-                if raw_ref_text:
-                    bibliography_map[ref_id] = re.sub(r'\s+', ' ', raw_ref_text).strip()
-        return bibliography_map
-
     def get_bibliography_map(self) -> dict:
-        """
-        Master method to get the bibliography map. It tries multiple strategies
-        and caches the result to avoid re-parsing.
-        """
-        if not self.soup:
+        if not self.specific_parser_instance:
+            logger.warning(f"get_bibliography_map: No specific parser for {self.xml_path}")
             return {}
-        if self._bib_map is not None:
-            # If map is already cached, format_used should also be cached implicitly (or we could re-set it)
-            # For simplicity, we assume if _bib_map is set, bibliography_format_used was set correctly before.
-            return self._bib_map
-
-        # Schema type is now determined in self.schema_type (from __init__)
-        bib_map = {}
-        current_schema_for_bib = self.schema_type # Use detected schema first
-
-        if current_schema_for_bib == "jats":
-            bib_map = self._parse_bib_jats()
-        elif current_schema_for_bib == "tei":
-            bib_map = self._parse_bib_tei()
-        elif current_schema_for_bib == "wiley":
-            bib_map = self._parse_bib_wiley()
-        elif current_schema_for_bib == "bioc":
-            bib_map = self._parse_bib_bioc()
-
-        # If primary schema detection yielded no bib_map, or if schema was 'unknown',
-        # try the sequential parsing strategy as a robust fallback.
-        if not bib_map:
-            if self.schema_type not in ["jats", "tei", "wiley", "bioc"] : # only log if schema was initially unknown
-                 logging.info(f"Schema for {self.xml_path} was '{self.schema_type}'. Attempting sequential bib parsing for bibliography.")
-
-            # Try JATS strategy first if not already tried or failed
-            if current_schema_for_bib != "jats":
-                bib_map = self._parse_bib_jats()
-                if bib_map: current_schema_for_bib = "jats" # Update if this worked
-
-            # Fallback to TEI strategy
-            if not bib_map and current_schema_for_bib != "tei":
-                bib_map = self._parse_bib_tei()
-                if bib_map: current_schema_for_bib = "tei"
-
-            # Fallback to Wiley strategy
-            if not bib_map and current_schema_for_bib != "wiley":
-                bib_map = self._parse_bib_wiley()
-                if bib_map: current_schema_for_bib = "wiley"
-
-            # Fallback to BioC strategy
-            if not bib_map and current_schema_for_bib != "bioc":
-                bib_map = self._parse_bib_bioc()
-                if bib_map: current_schema_for_bib = "bioc"
-
-        self._bib_map = bib_map # Cache the result
-        # Set bibliography_format_used based on what actually succeeded or was primary.
-        self.bibliography_format_used = current_schema_for_bib if bib_map else self.schema_type
-        if not bib_map:
-            logging.warning(f"No bibliography map extracted for {self.xml_path} even after fallbacks. Detected schema: {self.schema_type}, Bib parsing attempt order result: {self.bibliography_format_used}")
-
-        return self._bib_map
-
-    def _parse_bib_wiley(self) -> dict:
-        """Strategy 3: Attempts to parse the bibliography using a Wiley XML schema."""
-        if not self.soup: return {}
-        bibliography_map = {}
-        processed_keys = set()
-
-        # Strategy A: Look for <bib xml:id="..."> tags directly
-        direct_bib_tags = self.soup.find_all('bib')
-        for bib_tag in direct_bib_tags:
-            key = bib_tag.get('xml:id') # Primarily look for xml:id in <bib>
-            if key:
-                citation_element = bib_tag.find('citation')
-                if not citation_element:
-                    citation_alt_element = bib_tag.find('citation-alternatives')
-                    if citation_alt_element:
-                        citation_element = citation_alt_element.find('citation')
-
-                if citation_element:
-                    value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
-                    bibliography_map[key] = value
-                    processed_keys.add(key)
-
-        # Strategy B: Look for <ref-list> containing <ref id="...">
-        ref_list_tag = self.soup.find('ref-list')
-        if ref_list_tag:
-            ref_tags_in_list = ref_list_tag.find_all('ref')
-            for ref_tag in ref_tags_in_list:
-                key = ref_tag.get('id') # Primarily look for id in <ref>
-                if key and key not in processed_keys: # Avoid reprocessing if already handled by <bib xml:id>
-                    citation_element = ref_tag.find('citation')
-                    if not citation_element:
-                        citation_alt_element = ref_tag.find('citation-alternatives')
-                        if citation_alt_element:
-                            citation_element = citation_alt_element.find('citation')
-
-                    if citation_element:
-                        value = ' '.join(citation_element.get_text(separator=' ', strip=True).split())
-                        bibliography_map[key] = value
-                        processed_keys.add(key)
-
-        if bibliography_map:
-            logging.info(f"Parsed bibliography using Wiley strategy for {self.xml_path}")
-        return bibliography_map
-
-    def _parse_bib_bioc(self) -> dict:
-        """Strategy 4: Attempts to parse bibliography from BioC XML format."""
-        if not self.soup: return {}
-        bibliography_map = {}
-
-        passages = self.soup.find_all('passage')
-        ref_counter = 0
-
-        for passage in passages:
-            is_reference_passage = False
-            infons = passage.find_all('infon')
-            passage_infons = {}
-            for infon in infons:
-                key = infon.get('key')
-                if key:
-                    passage_infons[key] = infon.text.strip()
-                    if key == 'section_type' and infon.text.strip().upper() == 'REF':
-                        is_reference_passage = True
-
-            if is_reference_passage:
-                # Heuristic: try to ensure it's a "real" reference, not just a link like "See ref [5]"
-                # A simple check: must have some text content OR a 'source' infon.
-                passage_text_content = passage.find('text')
-                text_content_str = ' '.join(passage_text_content.get_text(separator=' ', strip=True).split()) if passage_text_content else ""
-
-                source = passage_infons.get('source', '')
-
-                # If it only has linking text and no source, skip (this is a basic heuristic)
-                if not source and text_content_str.lower().startswith("see ref") and len(passage_infons) < 3 : # arbitrary small number
-                    continue
-                if not source and not text_content_str and len(passage_infons) < 3: # likely not a real ref if no source, no text, few infons
-                    continue
-
-
-                ref_parts = []
-                # Attempt to reconstruct a somewhat ordered reference string
-                # This is highly heuristic and may need refinement based on common BioC structures
-
-                # Authors (if available under a known key, e.g. 'authors_str' or similar)
-                authors = passage_infons.get('authors_str') # Assuming a key 'authors_str' might exist
-                if authors: ref_parts.append(authors)
-
-                title = passage_infons.get('title', '') # Assuming a 'title' key for article/chapter title
-                if title: ref_parts.append(title)
-
-                if source: ref_parts.append(f"Source: {source}")
-
-                year = passage_infons.get('year')
-                if year: ref_parts.append(f"Year: {year}")
-
-                volume = passage_infons.get('volume')
-                if volume: ref_parts.append(f"Vol: {volume}")
-
-                issue = passage_infons.get('issue')
-                if issue: ref_parts.append(f"Issue: {issue}")
-
-                fpage = passage_infons.get('fpage')
-                lpage = passage_infons.get('lpage')
-                if fpage and lpage:
-                    ref_parts.append(f"pp. {fpage}-{lpage}")
-                elif fpage:
-                    ref_parts.append(f"p. {fpage}")
-
-                # Add any other direct text from the passage not captured in specific infons
-                if text_content_str and not any(text_content_str in part for part in ref_parts):
-                    # Avoid duplicating text if it was already part of a specific infon (e.g. if title was in <text>)
-                    # This check is very basic.
-                    is_already_present = False
-                    for key_info, val_info in passage_infons.items():
-                        if val_info == text_content_str:
-                            is_already_present = True
+        if self.specific_parser_instance._bib_map_cache is None:
+            logger.debug(f"XMLParser: Cache miss for bib_map on {self.xml_path}. Calling specific parser ({self.schema_type}).")
+            bib_map_result = self.specific_parser_instance.parse_bibliography()
+            self.specific_parser_instance._bib_map_cache = bib_map_result
+            # Set bibliography_format_used based on the schema type of the parser that produced the map
+            if bib_map_result:
+                self.bibliography_format_used = self.schema_type
+                # If GenericFallbackParser was used, it might have its own way to report what sub-parser worked.
+                # For now, if GenericFallbackParser, this will be 'unknown'.
+                if isinstance(self.specific_parser_instance, GenericFallbackParser) and not bib_map_result:
+                     # If generic failed, try a hard sequence (this duplicates some logic from old get_bib_map)
+                    logging.info(f"GenericFallbackParser failed for bib map on {self.xml_path}, trying sequence.")
+                    for schema_name, ConcreteParser in [("jats", JATSParser), ("tei", TEIParser), ("wiley", WileyParser), ("bioc", BioCParser)]:
+                        temp_parser = ConcreteParser(self.soup, self.xml_path, self.parser_used_for_soup)
+                        bib_map_result = temp_parser.parse_bibliography()
+                        if bib_map_result:
+                            self.bibliography_format_used = schema_name
+                            self.specific_parser_instance._bib_map_cache = bib_map_result # Update cache with successful result
+                            logger.info(f"Bib map for {self.xml_path} found by fallback to {schema_name}")
                             break
-                    if not is_already_present:
-                         ref_parts.append(text_content_str)
+            else: # No bib map found by the primary specific parser
+                self.bibliography_format_used = self.schema_type # or 'none' if schema_type itself was unknown and generic failed
+        return self.specific_parser_instance._bib_map_cache if self.specific_parser_instance._bib_map_cache is not None else {}
 
-
-                if not ref_parts and not source and not title and not year : # if still nothing substantial, skip
-                    continue
-
-                ref_string = ". ".join(filter(None, ref_parts))
-                if not ref_string.strip(): # Don't add empty references
-                    continue
-
-                # CHECK: If the constructed string is JUST a common bibliography title, and lacks other data, skip it.
-                common_bib_titles_to_skip = ["references", "bibliography", "literature cited", "reference list"]
-                # Check if the ref_string, when stripped and lowercased, is one of these titles
-                # AND if there isn't much other structured data (like source, year, fpage from infons)
-                # to suggest it's a legitimate reference that happens to have such a title.
-                if ref_string.strip().lower() in common_bib_titles_to_skip:
-                    has_other_data = passage_infons.get('source') or \
-                                     passage_infons.get('year') or \
-                                     passage_infons.get('fpage') or \
-                                     passage_infons.get('authors_str') # Check authors too
-                    # If it's a common title AND it lacks other distinguishing data, skip.
-                    if not has_other_data:
-                        logging.info(f"Skipping likely section title in BioC for {self.xml_path}: '{ref_string}'")
-                        continue
-
-                # DOI will be included if it's part of the text collected in ref_parts.
-                # No separate DOI field for consistency with other parsers for now.
-                ref_counter += 1
-                bibliography_map[str(ref_counter)] = ref_string
-
-        if bibliography_map:
-            logging.info(f"Parsed bibliography using BioC strategy for {self.xml_path} (found {ref_counter} refs)")
-        return bibliography_map
 
     def get_full_text(self) -> str:
-        """Extracts all human-readable text from the parsed document."""
-        if not self.soup:
+        if not self.specific_parser_instance:
+            logger.warning(f"get_full_text: No specific parser for {self.xml_path}")
             return ""
-        
-        text = ""
-        # Dispatch based on self.schema_type detected in __init__
-        if self.schema_type == "jats":
-            text = self._get_full_text_jats()
-        elif self.schema_type == "tei":
-            text = self._get_full_text_tei()
-        elif self.schema_type == "wiley":
-            text = self._get_full_text_wiley()
-        elif self.schema_type == "bioc":
-            text = self._get_full_text_bioc()
-        elif self.schema_type == "unknown_or_error" and not self.soup: # Handle case where soup is None
-            return ""
-        else: # Default for "unknown" or if specific parser failed to produce text (though they shouldn't return None)
-            logging.info(f"get_full_text: Using fallback text extraction for schema '{self.schema_type}' on file {self.xml_path}")
-            # Fallback for unknown or undetermined format
-            if self.soup:
-                # Basic fallback: try to remove common bibliography sections by tag name
-                temp_soup = BeautifulSoup(str(self.soup), self.parser_used) # Create a copy to manipulate
-                for tag_name in ['ref-list', 'listbibl', 'references', 'bibliography']:
-                    for section in temp_soup.find_all(tag_name):
-                        section.decompose()
-                text = temp_soup.get_text(separator=' ', strip=True)
-            else:
-                text = ""
+        if self.specific_parser_instance._full_text_cache is None:
+            logger.debug(f"XMLParser: Cache miss for full_text on {self.xml_path}. Calling specific parser ({self.schema_type}).")
+            self.specific_parser_instance._full_text_cache = self.specific_parser_instance.extract_full_text_excluding_bib()
+        return self.specific_parser_instance._full_text_cache
 
-        return ' '.join(text.split())
-
-    def _get_full_text_jats(self) -> str:
-        """Extracts full text for JATS format, excluding ref-list."""
-        if not self.soup: return ""
-
-        body_content = []
-
-        # Primary target: <body> element
-        body_element = self.soup.find('body')
-        if body_element:
-            # Exclude ref-list from body if it's nested
-            for ref_list in body_element.find_all('ref-list', recursive=False): # only top-level within body
-                ref_list.decompose()
-            body_content.append(body_element.get_text(separator=' ', strip=True))
-
-        # Fallback or additional: <article-text>
-        article_text_element = self.soup.find('article-text')
-        if article_text_element:
-            # Exclude ref-list from article-text if it's nested
-            for ref_list in article_text_element.find_all('ref-list', recursive=False):
-                ref_list.decompose()
-            # Avoid double-counting if body was inside article-text and already processed
-            # This is a simple check; real JATS can be complex.
-            # For now, we assume they are mostly separate or body is primary.
-            if not body_element or not body_element.find('article-text'):
-                 body_content.append(article_text_element.get_text(separator=' ', strip=True))
-
-        # If neither body nor article-text found, use root but remove ref-list
-        if not body_content:
-            temp_soup = BeautifulSoup(str(self.soup), self.parser_used)
-            for ref_list in temp_soup.find_all('ref-list'):
-                ref_list.decompose()
-            body_content.append(temp_soup.get_text(separator=' ', strip=True))
-
-        return ' '.join(body_content)
-
-    def _get_full_text_tei(self) -> str:
-        """Extracts full text for TEI format, excluding listBibl."""
-        if not self.soup: return ""
-        text_element = self.soup.find('text')
-        if text_element:
-            # Work on a copy to avoid modifying the original soup
-            temp_text_element = BeautifulSoup(str(text_element), self.parser_used)
-            for list_bibl in temp_text_element.find_all('listbibl'):
-                list_bibl.decompose()
-
-            # Prioritize <body> within <text>
-            body_element = temp_text_element.find('body')
-            if body_element:
-                return body_element.get_text(separator=' ', strip=True)
-            else: # If no <body> in <text>, use all of <text> (with listBibl removed)
-                return temp_text_element.get_text(separator=' ', strip=True)
-        return "" # Fallback if no <text> element
-
-    def _get_full_text_wiley(self) -> str:
-        """Extracts full text for Wiley format, attempting to exclude common bibliography sections."""
-        if not self.soup: return ""
-        # Wiley can be JATS-like or have its own structure.
-        # Start with a copy of the full soup.
-        temp_soup = BeautifulSoup(str(self.soup), self.parser_used)
-
-        # Remove common bibliography sections
-        for ref_list in temp_soup.find_all('ref-list'): # JATS-like
-            ref_list.decompose()
-        for references_sec in temp_soup.find_all('references'): # Common section name
-            references_sec.decompose()
-
-        # Specific Wiley: <bm> (back matter) often contains references.
-        # <component doi=" moléculis-2022-02694-comp001" id="moléculis-2022-02694-comp001" type="references">
-        for component in temp_soup.find_all('component', attrs={'type': 'references'}):
-            component.decompose()
-
-        # Try to find a <body> element
-        body_element = temp_soup.find('body')
-        if body_element:
-            return body_element.get_text(separator=' ', strip=True)
-
-        # If no <body>, return text of the modified soup.
-        # This is a broad fallback for Wiley.
-        return temp_soup.get_text(separator=' ', strip=True)
-
-    def _get_full_text_bioc(self) -> str:
-        """Extracts full text for BioC format from non-reference passages."""
-        if not self.soup: return ""
-
-        text_parts = []
-        passages = self.soup.find_all('passage')
-        for passage in passages:
-            is_reference_passage = False
-            infons = passage.find_all('infon')
-            for infon in infons:
-                key = infon.get('key')
-                # Check against common keys indicating a reference/bibliography section
-                if key in ['section_type', 'type'] and infon.text.strip().upper() in ['REF', 'REFERENCES', 'BIBLIOGRAPHY', 'BIBR']:
-                    is_reference_passage = True
-                    break
-
-            if not is_reference_passage:
-                text_content_tag = passage.find('text')
-                if text_content_tag:
-                    text_parts.append(text_content_tag.get_text(separator=' ', strip=True))
-
-        return ' '.join(text_parts)
-
-    def get_pointer_map(self) -> dict: # Renamed from find_pointers_in_text
-        """
-        Finds all in-text bibliographic pointers and maps their target ID to the citation text.
-        This method is schema-aware.
-        """
-        if not self.soup:
-            return [] # Return empty list for consistency with new return type
-
-        # Dispatch based on self.schema_type detected in __init__
-        if self.schema_type == "jats":
-            return self._get_pointers_jats()
-        elif self.schema_type == "tei":
-            return self._get_pointers_tei()
-        elif self.schema_type == "wiley":
-            return self._get_pointers_wiley()
-        elif self.schema_type == "bioc":
-            return self._get_pointers_bioc()
-        elif self.schema_type == "unknown_or_error" and not self.soup:
+    def get_pointer_map(self) -> list[dict]:
+        if not self.specific_parser_instance:
+            logger.warning(f"get_pointer_map: No specific parser for {self.xml_path}")
             return []
-        else: # Default for "unknown"
-            logging.info(f"get_pointer_map: Using generic pointer extraction for schema '{self.schema_type}' on file {self.xml_path}")
-            return self._get_pointers_generic()
+        if self.specific_parser_instance._pointer_map_cache is None:
+            logger.debug(f"XMLParser: Cache miss for pointer_map on {self.xml_path}. Calling specific parser ({self.schema_type}).")
+            self.specific_parser_instance._pointer_map_cache = self.specific_parser_instance.extract_pointers_with_context()
+        return self.specific_parser_instance._pointer_map_cache
 
-    def _get_pointers_generic(self) -> list[dict]: # Return type changed
-        """Generic pointer extraction, used as a fallback."""
-        if not self.soup: return [] # Return type changed
-        pointers_list = [] # Changed from pointers_map
-        # This is the old logic, primarily JATS-like
-        # Look for <ref type="bibr" target="...">
-        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
-            target = tag.get('target')
-            if target:
-                text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): # If ref tag is empty, use a generated string like [ID]
-                    text = f"[{target.lstrip('#')}]"
+# --- The XMLParser Class (Facade/Factory) ---
+# This class encapsulates all parsing logic for a single XML file.
 
-                context_text = self._find_contextual_parent_text(tag)
-                pointers_list.append({
-                    "target_id": target.lstrip('#'),
-                    "in_text_citation_string": ' '.join(text.split()),
-                    "context_text": context_text,
-                    "citation_tag_name": tag.name,
-                    "citation_tag_attributes": tag.attrs
-                })
+class XMLParser:
+    """
+    A robust parser for handling various academic XML formats found in the dataset.
+    It initializes with a file path and provides methods to extract key components.
+    """
+    def __init__(self, xml_path: str):
+        self.xml_path = xml_path
+        self.soup = None
+        self.parser_used_for_soup = None # Renamed from parser_used for clarity
+        self.bibliography_format_used = None # Set by get_bibliography_map based on successful strategy
+        self.schema_type = "unknown_or_error"
+        self.specific_parser_instance: BaseSpecificXMLParser | None = None
 
-        # Also look for <xref ref-type="bibr" rid="..."> which is common in JATS
-        # Removed 'if not pointers_map:' to collect both types
-        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
-            target_id = tag.get('rid')
-            if target_id:
-                text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): text = f"[{target_id.lstrip('#')}]" # Fallback text, use [ID] format
+        if not os.path.exists(xml_path):
+            logger.warning(f"File not found: {xml_path}")
+            return
 
-                context_text = self._find_contextual_parent_text(tag)
-                pointers_list.append({
-                    "target_id": target_id.lstrip('#'),
-                    "in_text_citation_string": ' '.join(text.split()),
-                    "context_text": context_text,
-                    "citation_tag_name": tag.name,
-                    "citation_tag_attributes": tag.attrs
-                })
-        return pointers_list
+        try:
+            with open(xml_path, 'r', encoding='utf-8') as f: content = f.read()
+            try:
+                self.soup = BeautifulSoup(content, 'lxml-xml')
+                if self.soup and self.soup.find(): self.parser_used_for_soup = 'lxml-xml'
+                else: self.soup = None # Ensure soup is None if parsing was not truly successful
+            except Exception: self.soup = None
+            if self.soup is None:
+                self.soup = BeautifulSoup(content, 'html.parser')
+                if self.soup and self.soup.find(): self.parser_used_for_soup = 'html.parser'
+                else: self.soup = None
+            if self.parser_used_for_soup:
+                 logger.info(f"Successfully parsed {xml_path} with {self.parser_used_for_soup}")
+            else:
+                 logger.error(f"Could not parse XML file: {xml_path} with any available BS4 parser.")
+                 return # Essential to return if soup is None
 
-    def _find_contextual_parent_text(self, tag, max_depth=5) -> str:
+        except Exception as e_file:
+            logger.error(f"Error reading file {xml_path}: {e_file}")
+            return # self.soup remains None
+
+        if self.soup:
+            self.schema_type = self._detect_schema()
+            logger.info(f"XMLParser: Initialized for {self.xml_path}. Detected schema: {self.schema_type}. BS4 parser: {self.parser_used_for_soup}")
+
+            parser_args = (self.soup, self.xml_path, self.parser_used_for_soup)
+            if self.schema_type == "jats": self.specific_parser_instance = JATSParser(*parser_args)
+            elif self.schema_type == "tei": self.specific_parser_instance = TEIParser(*parser_args)
+            elif self.schema_type == "wiley": self.specific_parser_instance = WileyParser(*parser_args)
+            elif self.schema_type == "bioc": self.specific_parser_instance = BioCParser(*parser_args)
+            else: # "unknown" or "unknown_or_error" (if soup was valid but schema unknown)
+                logger.warning(f"XMLParser: Using GenericFallbackParser for {self.xml_path} due to schema: {self.schema_type}")
+                self.specific_parser_instance = GenericFallbackParser(*parser_args)
+        else:
+            logger.error(f"XMLParser: self.soup is None for {self.xml_path}. Cannot instantiate specific parser.")
+            # self.specific_parser_instance remains None
+
+    def _detect_schema(self) -> str:
         """
-        Finds the text of the closest relevant block-level parent of a tag.
-        Searches up to max_depth.
+        Detects the XML schema type based on characteristic tags and DOCTYPE/namespaces.
+        Order of checks is important.
         """
-        context_parent_tags = ['p', 'div', 'li', 'section', 'article-section', 'body', 'article-body', 'text'] # Add more as needed
-        current_tag = tag
-        for _ in range(max_depth):
-            parent = current_tag.parent
-            if not parent:
-                break
-            # Check if parent.name (local name) is in our list of contextual tags
-            if parent.name and parent.name.lower() in context_parent_tags:
-                return ' '.join(parent.get_text(separator=' ', strip=True).split())
-            current_tag = parent
+        if not self.soup:
+            # This case should ideally be handled before calling _detect_schema,
+            # as __init__ already checks if self.soup is None.
+            # However, as a safeguard:
+            logger.error(f"SCHEMA_DETECT ({self.xml_path}): Soup is None at detection time.")
+            return 'unknown_or_error'
 
-        # Fallback: if no specific context parent found within depth, return text of the original tag's immediate parent
-        if tag.parent:
-            return ' '.join(tag.parent.get_text(separator=' ', strip=True).split())
-        return "" # Should ideally not happen if tag itself exists
+        # 1. Check DOCTYPE first
+        doctype_obj = next((item for item in self.soup.contents if isinstance(item, Doctype)), None)
+        if doctype_obj:
+            doctype_str = str(doctype_obj).upper()
+            if "JATS (Z39.96)" in doctype_str:
+                logger.info(f"Schema detected for {self.xml_path}: jats (DOCTYPE JATS (Z39.96))")
+                return 'jats'
+            if "BIOC.DTD" in doctype_str:
+                logger.info(f"Schema detected for {self.xml_path}: bioc (DOCTYPE BioC.dtd)")
+                return 'bioc'
 
-    def _get_pointers_jats(self) -> list[dict]: # Return type changed
-        """Extracts in-text citation pointers for JATS format."""
-        if not self.soup: return [] # Return empty list
-        pointers_list = []
+        # 2. Check root element name and namespaces
+        root_element = self.soup.find()
+        if root_element:
+            root_name_lower = root_element.name.lower() if root_element.name else ""
+            root_xmlns = root_element.get('xmlns', '').lower()
+            if root_name_lower == 'tei' and root_xmlns == "http://www.tei-c.org/ns/1.0":
+                logger.info(f"Schema detected for {self.xml_path}: tei (root <tei> with TEI namespace)")
+                return 'tei'
+            wiley_ns = "http://www.wiley.com/namespaces/wiley"
+            if root_xmlns == wiley_ns:
+                 logger.info(f"Schema detected for {self.xml_path}: wiley (root element with Wiley namespace)")
+                 return 'wiley'
+            if self.soup.find(lambda tag: tag.name and tag.name.lower() == 'component' and tag.get('xmlns', '').lower() == wiley_ns):
+                logger.info(f"Schema detected for {self.xml_path}: wiley (<component> with Wiley namespace)")
+                return 'wiley'
 
-        # Using a set to keep track of processed target_ids to avoid duplicates
-        # if multiple rules could match the same conceptual pointer.
-        # However, different tags pointing to the same target_id with different context/text are preserved.
-        # This specific duplicate handling might be refined based on desired behavior.
+        # 3. Fallback to tag-based heuristics
+        # BioC heuristic
+        passages = self.soup.find_all('passage')
+        is_bioc_struct = self.soup.find('collection') and self.soup.find('document') and passages
+        if passages:
+            for passage in passages:
+                for infon in passage.find_all('infon'):
+                    key = infon.get('key')
+                    if key in ['section_type', 'type'] and infon.text.strip().upper() in ['REF', 'REFERENCES', 'BIBLIOGRAPHY', 'BIBR']:
+                        if not (self.soup.find('journal-meta') or self.soup.find('component', attrs={'type': 'references'})):
+                            logger.info(f"Schema detected for {self.xml_path}: bioc (heuristic: REF passage infon)")
+                            return 'bioc'
+        if is_bioc_struct and self.soup.find('infon'):
+            if not (self.soup.find('journal-meta') or self.soup.find('component', attrs={'type': 'references'}) or \
+                    self.soup.find('listBibl') or self.soup.find('ref-list')):
+                logger.info(f"Schema detected for {self.xml_path}: bioc (heuristic: general BioC structure)")
+                return 'bioc'
+        # Wiley heuristic
+        if self.soup.find('component', attrs={'type': 'references'}):
+            logger.info(f"Schema detected for {self.xml_path}: wiley (heuristic: component type='references')")
+            return 'wiley'
+        if self.soup.find('doi_batch_id'):
+            logger.info(f"Schema detected for {self.xml_path}: wiley (heuristic: doi_batch_id)")
+            return 'wiley'
+        # JATS heuristic
+        has_ref_list = self.soup.find('ref-list')
+        has_structural_jats = (self.soup.find('front') and self.soup.find('article-meta') and self.soup.find('journal-meta')) or \
+                              self.soup.find('article', attrs={'article-type': True})
+        if has_ref_list and has_structural_jats:
+            logger.info(f"Schema detected for {self.xml_path}: jats (heuristic: ref-list and JATS structural tags)")
+            return 'jats'
+        # TEI heuristic
+        if self.soup.find('listBibl') and self.soup.find('teiHeader'):
+            logger.info(f"Schema detected for {self.xml_path}: tei (heuristic: listBibl and teiHeader)")
+            return 'tei'
+        # Wiley <bib xml:id> heuristic
+        if self.soup.find('bib', attrs={'xml:id': True}):
+            if not (self.soup.find('teiHeader') or has_structural_jats):
+                logger.info(f"Schema detected for {self.xml_path}: wiley (heuristic: bib xml:id and not strong TEI/JATS)")
+                return 'wiley'
+        # JATS-like Wiley or simple JATS fallback
+        if has_ref_list and self.soup.find('ref'):
+            ref_list_tag = self.soup.find('ref-list')
+            if ref_list_tag and (first_ref := ref_list_tag.find('ref')) and first_ref.find('citation'):
+                logger.info(f"Schema detected for {self.xml_path}: wiley (heuristic: JATS-like ref-list with <citation>)")
+                return 'wiley'
+            logger.info(f"Schema detected for {self.xml_path}: jats (heuristic fallback: ref-list and ref tags)")
+            return 'jats'
+        logger.warning(f"XML schema not confidently detected for {self.xml_path}. Defaulting to 'unknown'.")
+        return 'unknown'
 
-        # Prioritize <xref ref-type="bibr" rid="ID">text</xref>
-        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
-            target_id = tag.get('rid')
-            if target_id:
-                text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): # If xref is empty but has rid, use the rid as text like [rid]
-                    text = f"[{target_id.lstrip('#')}]"
-
-                context_text = self._find_contextual_parent_text(tag)
-                pointers_list.append({
-                    "target_id": target_id.lstrip('#'),
-                    "in_text_citation_string": ' '.join(text.split()),
-                    "context_text": context_text,
-                    "citation_tag_name": tag.name,
-                    "citation_tag_attributes": tag.attrs
-                })
-
-        # Fallback or alternative: <ref type="bibr" target="#ID">text</ref>
-        # Only add if not already captured by a similar <xref> to the same target from same conceptual location.
-        # For simplicity now, we'll add all found, potential duplicates can be handled by consumer or by refining keying here.
-        # The current _find_contextual_parent_text might give same context if xref and ref are siblings for same target.
-
-        # To avoid adding a <ref> if an <xref> already covered it for the same conceptual pointer,
-        # we might need a more complex check than just target_id, e.g. involving source line numbers or exact context.
-        # For now, let's assume that JATS files will use one style or the other consistently for a given pointer,
-        # or that downstream processing can handle multiple "views" of the same conceptual pointer if structure is weird.
-
-        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
-            target = tag.get('target') # JATS often uses target="#id"
-            if target:
-                target_id = target.lstrip('#')
-                # Simple check: if this target_id was already added by an xref, skip.
-                # This assumes xref is preferred. This is a basic de-duplication.
-                already_added_by_xref = False
-                for p_dict in pointers_list:
-                    if p_dict["target_id"] == target_id and p_dict["citation_tag_name"] == 'xref':
-                        already_added_by_xref = True
-                        break
-                if already_added_by_xref:
-                    continue
-
-                text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): # If ref tag is empty, use the target ID as text
-                     text = f"[{target_id}]" # Use target_id not target.lstrip('#') for consistency
-
-                context_text = self._find_contextual_parent_text(tag)
-                pointers_list.append({
-                    "target_id": target_id,
-                    "in_text_citation_string": ' '.join(text.split()),
-                    "context_text": context_text,
-                    "citation_tag_name": tag.name,
-                    "citation_tag_attributes": tag.attrs
-                })
-        return pointers_list
-
-    def _get_pointers_tei(self) -> list[dict]: # Return type changed
-        """Extracts in-text citation pointers for TEI format."""
-        if not self.soup: return [] # Return empty list
-        pointers_list = []
-        # Look for <ref target="#ID">text</ref>
-        for tag in self.soup.find_all('ref'): # TEI <ref> might not have a 'type'
-            target = tag.get('target')
-            if target and target.startswith('#'): # Ensure it's an internal link
-                target_id = target.lstrip('#')
-                text = tag.get_text(separator=' ', strip=True)
-                if not text.strip(): # If ref tag is empty, use the target ID as text
-                    text = f"[{target_id}]"
-
-                context_text = self._find_contextual_parent_text(tag)
-                pointers_list.append({
-                    "target_id": target_id,
-                    "in_text_citation_string": ' '.join(text.split()),
-                    "context_text": context_text,
-                    "citation_tag_name": tag.name,
-                    "citation_tag_attributes": tag.attrs
-                })
-
-        # Also consider <ptr target="#ID"/>, often used for empty pointers.
-        for tag in self.soup.find_all('ptr'):
-            target = tag.get('target')
-            if target and target.startswith('#'):
-                target_id = target.lstrip('#')
-                # Check if this pointer (target_id) was already captured by a <ref> tag.
-                # This avoids duplicates if a <ptr> and <ref> point to the same thing, preferring <ref> if it had text.
-                already_added = any(p_dict["target_id"] == target_id for p_dict in pointers_list)
-                if already_added:
-                    continue
-
-                text = f"[{target_id}]" # <ptr> tags are usually empty, so generate text
-                context_text = self._find_contextual_parent_text(tag)
-                pointers_list.append({
-                    "target_id": target_id,
-                    "in_text_citation_string": text, # No .split() needed for generated text
-                    "context_text": context_text,
-                    "citation_tag_name": tag.name,
-                    "citation_tag_attributes": tag.attrs
-                })
-        return pointers_list
-
-    def _get_pointers_wiley(self) -> list[dict]: # Return type changed
-        """Extracts in-text citation pointers for Wiley format."""
-        if not self.soup: return [] # Return empty list
-        pointers_list = []
-
-        # Helper to create and add pointer dict to list
-        def _add_wiley_pointer(tag, target_id_attr_name, id_prefix=''):
-            target_val = tag.get(target_id_attr_name)
-            if target_val:
-                target_id = target_val.lstrip(id_prefix) # Handles href="#" or rid=""
-                text_content = tag.get_text(separator=' ', strip=True)
-                if not text_content.strip():
-                    text_content = f"[{target_id}]"
-
-                context_text = self._find_contextual_parent_text(tag)
-                # Basic de-duplication: check if this exact pointer (target_id + text + context) is already added
-                # This is very basic; a more robust check might be needed if tags are nested weirdly
-                # For now, we assume different tags or locations mean different conceptual pointers even if text/target are same
-
-                # A simple way to avoid adding the exact same dictionary again if multiple rules match same tag
-                new_pointer = {
-                    "target_id": target_id,
-                    "in_text_citation_string": ' '.join(text_content.split()),
-                    "context_text": context_text,
-                    "citation_tag_name": tag.name,
-                    "citation_tag_attributes": tag.attrs
-                }
-                # This check for full dict duplication is probably too strict or unnecessary
-                # if not any(p == new_pointer for p in pointers_list):
-                #    pointers_list.append(new_pointer)
-                # Let's just add for now and assume consumer handles semantic duplicates if needed.
-                # Or, add a set of (target_id, context_text_start_few_chars, in_text_string) to avoid obvious re-adds
-                pointers_list.append(new_pointer)
+    def get_bibliography_map(self) -> dict:
+        if not self.specific_parser_instance:
+            logger.warning(f"get_bibliography_map: No specific parser for {self.xml_path}")
+            return {}
+        if self.specific_parser_instance._bib_map_cache is None:
+            logger.debug(f"XMLParser: Cache miss for bib_map on {self.xml_path}. Calling specific parser ({self.schema_type}).")
+            bib_map_result = self.specific_parser_instance.parse_bibliography()
+            self.specific_parser_instance._bib_map_cache = bib_map_result
+            # Set bibliography_format_used based on the schema type of the parser that produced the map
+            if bib_map_result:
+                self.bibliography_format_used = self.schema_type
+                # If GenericFallbackParser was used, it might have its own way to report what sub-parser worked.
+                # For now, if GenericFallbackParser, this will be 'unknown'.
+                if isinstance(self.specific_parser_instance, GenericFallbackParser) and not bib_map_result:
+                     # If generic failed, try a hard sequence (this duplicates some logic from old get_bib_map)
+                    logging.info(f"GenericFallbackParser failed for bib map on {self.xml_path}, trying sequence.")
+                    for schema_name, ConcreteParser in [("jats", JATSParser), ("tei", TEIParser), ("wiley", WileyParser), ("bioc", BioCParser)]:
+                        temp_parser = ConcreteParser(self.soup, self.xml_path, self.parser_used_for_soup)
+                        bib_map_result = temp_parser.parse_bibliography()
+                        if bib_map_result:
+                            self.bibliography_format_used = schema_name
+                            self.specific_parser_instance._bib_map_cache = bib_map_result # Update cache with successful result
+                            logger.info(f"Bib map for {self.xml_path} found by fallback to {schema_name}")
+                            break
+            else: # No bib map found by the primary specific parser
+                self.bibliography_format_used = self.schema_type # or 'none' if schema_type itself was unknown and generic failed
+        return self.specific_parser_instance._bib_map_cache if self.specific_parser_instance._bib_map_cache is not None else {}
 
 
-        # Attempt 1: JATS-like <xref ref-type="bibr" rid="ID">text</xref>
-        for tag in self.soup.find_all('xref', attrs={'ref-type': 'bibr'}):
-            _add_wiley_pointer(tag, 'rid')
+    def get_full_text(self) -> str:
+        if not self.specific_parser_instance:
+            logger.warning(f"get_full_text: No specific parser for {self.xml_path}")
+            return ""
+        if self.specific_parser_instance._full_text_cache is None:
+            logger.debug(f"XMLParser: Cache miss for full_text on {self.xml_path}. Calling specific parser ({self.schema_type}).")
+            self.specific_parser_instance._full_text_cache = self.specific_parser_instance.extract_full_text_excluding_bib()
+        return self.specific_parser_instance._full_text_cache
 
-        # Attempt 2: <ref type="bibr" target="#ID">text</ref>
-        for tag in self.soup.find_all('ref', attrs={'type': 'bibr'}):
-            _add_wiley_pointer(tag, 'target', id_prefix='#')
-
-        # Attempt 3: Wiley-specific <link href="#ID">text</link>
-        for tag in self.soup.find_all('link'):
-            _add_wiley_pointer(tag, 'href', id_prefix='#')
-
-        # Attempt 4: Generic <ref target="..."> (fallback)
-        # Only if it wasn't already processed as a <ref type="bibr">
-        processed_ref_targets_from_bibr = {p['target_id'] for p in pointers_list if p['citation_tag_name'] == 'ref' and p['citation_tag_attributes'].get('type') == 'bibr'}
-
-        for tag in self.soup.find_all('ref'):
-            if tag.attrs.get('type') == 'bibr': # Already handled by Attempt 2
-                continue
-
-            target = tag.get('target')
-            if target and target.startswith('#') and re.match(r'#([a-zA-Z0-9\-_.:]+)', target):
-                if target.lstrip('#') in processed_ref_targets_from_bibr: # Avoid double adding from specific rule
-                    continue
-                _add_wiley_pointer(tag, 'target', id_prefix='#')
-
-        return pointers_list
-
-    def _get_pointers_bioc(self) -> list[dict]: # Return type changed
-        """
-        Extracts in-text citation pointers for BioC format.
-        Relies on finding <annotation> elements that are typed as citations
-        and link to a bibliography item (or an internally generated ID).
-        """
-        if not self.soup: return [] # Return empty list
-        pointers_list = []
-
-        for ann_tag in self.soup.find_all('annotation'):
-            is_citation_annotation = False
-            target_id_from_infon = None
-            in_text_citation_string = None
-
-            infons = ann_tag.find_all('infon')
-            temp_attrs = {infon.get('key'): infon.text for infon in infons if infon.get('key')}
-
-
-            for infon_tag in infons: # Re-iterate to ensure order of preference for keys if multiple exist
-                key_attr = infon_tag.get('key')
-                if key_attr == 'type' and infon_tag.text.lower() in ['citation', 'reference', 'bibr', 'ref']:
-                    is_citation_annotation = True
-                # Prioritize specific keys for target_id
-                if key_attr in ['referenced_bib_id', 'target_bib_id', 'targetid', 'rid', 'target_id', 'target']:
-                    target_id_from_infon = infon_tag.text.strip().lstrip('#')
-                    # Break if a high-priority target key is found, or define an order
-                    # For now, last one found with these keys will be used. More specific logic might be needed.
-
-            if is_citation_annotation and target_id_from_infon:
-                text_tag = ann_tag.find('text')
-                if text_tag and text_tag.text.strip():
-                    in_text_citation_string = text_tag.text.strip()
-                else:
-                    # If no <text> tag or empty, use a placeholder based on target_id_from_infon
-                    # Or, if the annotation tag itself has text (unlikely for BioC but possible)
-                    ann_tag_direct_text = ann_tag.text # This gets all text within annotation, including infons, be careful
-                    # A better fallback might be just the ID.
-                    in_text_citation_string = f"[{target_id_from_infon}]"
-
-                context_text = self._find_contextual_parent_text(ann_tag)
-                pointers_list.append({
-                    "target_id": target_id_from_infon,
-                    "in_text_citation_string": ' '.join(in_text_citation_string.split()),
-                    "context_text": context_text,
-                    "citation_tag_name": ann_tag.name, # "annotation"
-                    "citation_tag_attributes": temp_attrs # Store all infons as attributes
-                })
-
-        # If no explicit annotations found, this method won't find pointers for BioC.
-        return pointers_list
-
+    def get_pointer_map(self) -> list[dict]:
+        if not self.specific_parser_instance:
+            logger.warning(f"get_pointer_map: No specific parser for {self.xml_path}")
+            return []
+        if self.specific_parser_instance._pointer_map_cache is None:
+            logger.debug(f"XMLParser: Cache miss for pointer_map on {self.xml_path}. Calling specific parser ({self.schema_type}).")
+            self.specific_parser_instance._pointer_map_cache = self.specific_parser_instance.extract_pointers_with_context()
+        return self.specific_parser_instance._pointer_map_cache
