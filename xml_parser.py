@@ -69,6 +69,66 @@ class XMLParser:
             logging.error(f"Error reading file {xml_path}: {e_file}")
             self.soup = None
 
+    def _detect_schema(self) -> str:
+        """
+        Detects the XML schema type based on characteristic tags.
+        """
+        if self.soup.find('ref-list'):
+            return 'jats'
+        if self.soup.find('listBibl'):
+            return 'tei'
+        if self.soup.find('bib', attrs={'xml:id': True}) or self.soup.find('ref-list') and self.soup.find('ref'):
+            return 'wiley' # Wiley can be complex and JATS-like
+        if self.soup.find('infon', text=re.compile('^REF$', re.IGNORECASE)):
+            return 'bioc'
+        # Add more heuristics here if needed
+        return 'unknown'
+
+    def get_bibliography_map(self) -> dict:
+        """
+        Master method to get the bibliography map. It tries multiple strategies
+        and caches the result to avoid re-parsing.
+        """
+        if not self.soup:
+            return {}
+        if self._bib_map is not None:
+            # If map is already cached, format_used should also be cached implicitly (or we could re-set it)
+            # For simplicity, we assume if _bib_map is set, bibliography_format_used was set correctly before.
+            return self._bib_map
+
+        self.bibliography_format_used = None # Reset / ensure it's fresh for this parse attempt
+
+        # Try JATS strategy first
+        bib_map = self._parse_bib_jats()
+        if bib_map:
+            self._bib_map = bib_map
+            self.bibliography_format_used = "jats"
+            return self._bib_map
+        
+        # Fallback to TEI strategy
+        bib_map = self._parse_bib_tei()
+        if bib_map:
+            self._bib_map = bib_map
+            self.bibliography_format_used = "tei"
+            return self._bib_map
+        
+        # Fallback to Wiley strategy
+        bib_map = self._parse_bib_wiley()
+        if bib_map:
+            self._bib_map = bib_map
+            self.bibliography_format_used = "wiley"
+            return self._bib_map
+
+        # Fallback to BioC strategy
+        bib_map = self._parse_bib_bioc()
+        if bib_map:
+            self._bib_map = bib_map
+            self.bibliography_format_used = "bioc"
+            return self._bib_map
+
+        self._bib_map = {}
+        return self._bib_map
+
     def _parse_bib_jats(self) -> dict:
         """Strategy 1: Attempts to parse the bibliography using the JATS schema."""
         if not self.soup: return {}
@@ -125,51 +185,6 @@ class XMLParser:
                 if raw_ref_text:
                     bibliography_map[ref_id] = re.sub(r'\s+', ' ', raw_ref_text).strip()
         return bibliography_map
-
-    def get_bibliography_map(self) -> dict:
-        """
-        Master method to get the bibliography map. It tries multiple strategies
-        and caches the result to avoid re-parsing.
-        """
-        if not self.soup:
-            return {}
-        if self._bib_map is not None:
-            # If map is already cached, format_used should also be cached implicitly (or we could re-set it)
-            # For simplicity, we assume if _bib_map is set, bibliography_format_used was set correctly before.
-            return self._bib_map
-
-        self.bibliography_format_used = None # Reset / ensure it's fresh for this parse attempt
-
-        # Try JATS strategy first
-        bib_map = self._parse_bib_jats()
-        if bib_map:
-            self._bib_map = bib_map
-            self.bibliography_format_used = "jats"
-            return self._bib_map
-        
-        # Fallback to TEI strategy
-        bib_map = self._parse_bib_tei()
-        if bib_map:
-            self._bib_map = bib_map
-            self.bibliography_format_used = "tei"
-            return self._bib_map
-        
-        # Fallback to Wiley strategy
-        bib_map = self._parse_bib_wiley()
-        if bib_map:
-            self._bib_map = bib_map
-            self.bibliography_format_used = "wiley"
-            return self._bib_map
-
-        # Fallback to BioC strategy
-        bib_map = self._parse_bib_bioc()
-        if bib_map:
-            self._bib_map = bib_map
-            self.bibliography_format_used = "bioc"
-            return self._bib_map
-
-        self._bib_map = {}
-        return self._bib_map
 
     def _parse_bib_wiley(self) -> dict:
         """Strategy 3: Attempts to parse the bibliography using a Wiley XML schema."""
