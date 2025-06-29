@@ -1,4 +1,7 @@
-<TEI>
+<TEI xmlns="http://www.tei-c.org/ns/1.0">
+    <teiHeader>
+        <fileDesc><titleStmt><title>Sample TEI Title</title></titleStmt></fileDesc>
+    </teiHeader>
     <text>
         <body>
             <p>This is a TEI article. Pointer to ref <ref target="#tei_ref1">(Author, 2023)</ref>. Direct DOI: 10.1000/tei.example.</p>

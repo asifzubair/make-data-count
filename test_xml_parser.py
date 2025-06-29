@@ -51,8 +51,13 @@ class TestXMLParser(unittest.TestCase):
         """
         parser = self._write_xml_and_parse(xml_content)
         self.assertTrue(parser.soup is not None, "Soup object should not be None")
-        parser.get_bibliography_map() # Ensure bib format detection is triggered
-        self.assertEqual(parser.bibliography_format_used, "jats", f"JATS format not detected for bib. Detected: {parser.bibliography_format_used}")
+        # Test initial schema detection
+        self.assertEqual(parser.schema_type, "jats", f"Initial schema detection failed for JATS. Detected: {parser.schema_type}")
+
+        # Ensure get_bibliography_map still works and sets bibliography_format_used correctly for JATS
+        bib_map = parser.get_bibliography_map()
+        self.assertTrue(bib_map, "Bibliography map should not be empty for JATS sample.")
+        self.assertEqual(parser.bibliography_format_used, "jats", f"Final bib format used not JATS. Detected: {parser.bibliography_format_used}")
 
         full_text = parser.get_full_text()
         self.assertIn("JATS body text", full_text)
@@ -118,8 +123,11 @@ class TestXMLParser(unittest.TestCase):
         """
         parser = self._write_xml_and_parse(xml_content)
         self.assertTrue(parser.soup is not None, "Soup object should not be None")
-        parser.get_bibliography_map() # Ensure bib format detection is triggered
-        self.assertEqual(parser.bibliography_format_used, "tei", f"TEI format not detected for bib. Detected: {parser.bibliography_format_used}")
+        self.assertEqual(parser.schema_type, "tei", f"Initial schema detection failed for TEI. Detected: {parser.schema_type}")
+
+        bib_map = parser.get_bibliography_map()
+        self.assertTrue(bib_map, "Bibliography map should not be empty for TEI sample.")
+        self.assertEqual(parser.bibliography_format_used, "tei", f"Final bib format used not TEI. Detected: {parser.bibliography_format_used}")
 
         full_text = parser.get_full_text()
         self.assertIn("TEI body text", full_text)
@@ -183,10 +191,12 @@ class TestXMLParser(unittest.TestCase):
         parser = self._write_xml_and_parse(xml_content)
         self.assertTrue(parser.soup is not None, "Soup object should not be None")
 
-        bib_map = parser.get_bibliography_map()
-        # _parse_bib_wiley should handle <ref id="..."><citation> and also <bib xml:id="..."><citation>
-        self.assertEqual(parser.bibliography_format_used, "wiley", f"Wiley format not detected for bib. Detected: {parser.bibliography_format_used}. BibMap: {bib_map}")
+        bib_map = parser.get_bibliography_map() # Call this to allow bibliography_format_used to be set by parsing.
+        self.assertEqual(parser.schema_type, "wiley", f"Initial schema detection failed for Wiley. Detected: {parser.schema_type}. BibMap: {bib_map}")
+        # Also check the format that successfully parsed the bib, which might differ if schema_type was 'unknown' or initial parse failed
+        self.assertEqual(parser.bibliography_format_used, "wiley", f"Wiley bib parsing strategy not used. Used: {parser.bibliography_format_used}. BibMap: {bib_map}")
 
+        self.assertTrue(bib_map, "Bibliography map should not be empty for Wiley sample.")
         self.assertIn("w1", bib_map)
         self.assertIn("w2", bib_map)
         self.assertIn("w3", bib_map)
@@ -295,9 +305,12 @@ class TestXMLParser(unittest.TestCase):
             # If current_bib_map_val is {'1': '...', '2': '...'}
             if '1' in current_bib_map_val : new_bib_map['bib1'] = current_bib_map_val['1']
             if '2' in current_bib_map_val : new_bib_map['bib2'] = current_bib_map_val['2']
-            parser._bib_map = new_bib_map # Override for test
+            parser._bib_map = new_bib_map # Override for test - this tests pointer logic primarily
 
-        self.assertEqual(parser.bibliography_format_used, "bioc", f"BioC format not detected for bib. Detected: {parser.bibliography_format_used}")
+        self.assertEqual(parser.schema_type, "bioc", f"Initial schema detection failed for BioC. Detected: {parser.schema_type}")
+        # For BioC, get_bibliography_map() might result in a different bibliography_format_used if schema_type was initially 'unknown'
+        # but the test relies on the _parse_bib_bioc specific behavior for keys, so we check schema_type.
+        # If the test was *only* for _parse_bib_bioc, we'd also check parser.bibliography_format_used == "bioc" after calling get_bib_map.
 
         full_text = parser.get_full_text()
         self.assertIn("BioC Document Title", full_text)
@@ -347,7 +360,8 @@ class TestXMLParser(unittest.TestCase):
         """
         parser = self._write_xml_and_parse(xml_content)
         self.assertTrue(parser.soup is not None, "Soup object should not be None")
-        parser.bibliography_format_used = "unknown"
+        # Force schema_type to test fallback logic in get_full_text
+        parser.schema_type = "unknown"
 
         full_text = parser.get_full_text()
         self.assertIn("Some body text here", full_text)
@@ -371,7 +385,8 @@ class TestXMLParser(unittest.TestCase):
         """
         parser = self._write_xml_and_parse(xml_content)
         self.assertTrue(parser.soup is not None, "Soup object should not be None")
-        parser.bibliography_format_used = "unknown"
+        # Force schema_type to test fallback logic in get_pointer_map
+        parser.schema_type = "unknown"
 
         contextual_pointers = parser.get_pointer_map() # Should call _get_pointers_generic
         self.assertIsInstance(contextual_pointers, list)

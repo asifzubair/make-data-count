@@ -24,8 +24,9 @@ class XMLParser:
         self.xml_path = xml_path
         self.soup = None
         self._bib_map = None # Use for caching the parsed bibliography
-        self.parser_used = None
-        self.bibliography_format_used = None # Stores which strategy successfully parsed the bib
+        self.parser_used = None # Stores 'lxml-xml' or 'html.parser'
+        self.bibliography_format_used = None # DEPRECATED by schema_type, but kept for now as bib parsing sets it.
+        self.schema_type = "unknown_or_error" # Initialize schema_type
 
         if not os.path.exists(xml_path):
             logging.warning(f"File not found: {xml_path}")
@@ -69,65 +70,93 @@ class XMLParser:
             logging.error(f"Error reading file {xml_path}: {e_file}")
             self.soup = None
 
+        if self.soup:
+            self.schema_type = self._detect_schema()
+            # Log the detected schema type from __init__ to make it clearly visible upon instantiation
+            logging.info(f"XMLParser instantiated for {self.xml_path}. Detected schema: {self.schema_type}. BS4 parser: {self.parser_used}")
+        else:
+            # If soup is None (e.g. file not found, critical parse error), schema_type remains 'unknown_or_error'
+            logging.error(f"XMLParser instantiated for {self.xml_path}, but self.soup is None. Schema detection skipped.")
+
+
+    # Refined _detect_schema method based on discussion:
     def _detect_schema(self) -> str:
         """
         Detects the XML schema type based on characteristic tags.
-        """
-        if self.soup.find('ref-list'):
-            return 'jats'
-        if self.soup.find('listBibl'):
-            return 'tei'
-        if self.soup.find('bib', attrs={'xml:id': True}) or self.soup.find('ref-list') and self.soup.find('ref'):
-            return 'wiley' # Wiley can be complex and JATS-like
-        if self.soup.find('infon', text=re.compile('^REF$', re.IGNORECASE)):
-            return 'bioc'
-        # Add more heuristics here if needed
-        return 'unknown'
-
-    def get_bibliography_map(self) -> dict:
-        """
-        Master method to get the bibliography map. It tries multiple strategies
-        and caches the result to avoid re-parsing.
+        Order of checks is important to resolve ambiguities.
         """
         if not self.soup:
-            return {}
-        if self._bib_map is not None:
-            # If map is already cached, format_used should also be cached implicitly (or we could re-set it)
-            # For simplicity, we assume if _bib_map is set, bibliography_format_used was set correctly before.
-            return self._bib_map
+            logging.error(f"SCHEMA_DETECT ({self.xml_path}): Soup is None.")
+            return 'unknown_or_error'
 
-        self.bibliography_format_used = None # Reset / ensure it's fresh for this parse attempt
+        # BioC check: Look for characteristic passage/infon structure for REF sections
+        passages = self.soup.find_all('passage')
+        is_bioc_candidate_by_structure = self.soup.find('collection') and self.soup.find('document') and passages
 
-        # Try JATS strategy first
-        bib_map = self._parse_bib_jats()
-        if bib_map:
-            self._bib_map = bib_map
-            self.bibliography_format_used = "jats"
-            return self._bib_map
-        
-        # Fallback to TEI strategy
-        bib_map = self._parse_bib_tei()
-        if bib_map:
-            self._bib_map = bib_map
-            self.bibliography_format_used = "tei"
-            return self._bib_map
-        
-        # Fallback to Wiley strategy
-        bib_map = self._parse_bib_wiley()
-        if bib_map:
-            self._bib_map = bib_map
-            self.bibliography_format_used = "wiley"
-            return self._bib_map
+        if passages: # Only proceed if passages exist
+            for passage in passages:
+                infons = passage.find_all('infon')
+                for infon in infons:
+                    key = infon.get('key')
+                    if key in ['section_type', 'type'] and infon.text.strip().upper() in ['REF', 'REFERENCES', 'BIBLIOGRAPHY', 'BIBR']:
+                        # Try to avoid misclassifying JATS/Wiley if they use similar infon patterns in weird ways
+                        if not self.soup.find('journal-meta') and not self.soup.find('component', attrs={'type': 'references'}):
+                            logging.info(f"Schema detected for {self.xml_path}: bioc (based on REF passage infon)")
+                            return 'bioc'
 
-        # Fallback to BioC strategy
-        bib_map = self._parse_bib_bioc()
-        if bib_map:
-            self._bib_map = bib_map
-            self.bibliography_format_used = "bioc"
-            return self._bib_map
+        if is_bioc_candidate_by_structure and self.soup.find('infon'): # General BioC structure as fallback
+             # Check again it's not something else more specific that was missed by the REF check
+            if not self.soup.find('journal-meta') and \
+               not self.soup.find('component', attrs={'type': 'references'}) and \
+               not self.soup.find('listBibl') and \
+               not self.soup.find('ref-list'):
+                logging.info(f"Schema detected for {self.xml_path}: bioc (based on general BioC structure: collection/document/passage/infon)")
+                return 'bioc'
 
-        self._bib_map = {}
-        return self._bib_map
+
+        # Wiley check: Look for more unique Wiley identifiers first
+        if self.soup.find('component', attrs={'type': 'references'}):
+            logging.info(f"Schema detected for {self.xml_path}: wiley (based on component type='references')")
+            return 'wiley'
+        if self.soup.find('doi_batch_id'):
+            logging.info(f"Schema detected for {self.xml_path}: wiley (based on doi_batch_id)")
+            return 'wiley'
+
+        # More specific JATS check
+        # Looks for ref-list AND ( (front AND article-meta AND journal-meta) OR article[@article-type] )
+        has_ref_list = self.soup.find('ref-list')
+        has_front_article_meta_journal_meta = self.soup.find('front') and \
+                                              self.soup.find('article-meta') and \
+                                              self.soup.find('journal-meta')
+        has_article_with_type = self.soup.find('article', attrs={'article-type': True})
+
+        if has_ref_list and (has_front_article_meta_journal_meta or has_article_with_type):
+            logging.info(f"Schema detected for {self.xml_path}: jats (based on ref-list and other JATS structural tags)")
+            return 'jats'
+
+        # TEI check
+        if self.soup.find('listBibl') and self.soup.find('teiHeader'):
+            logging.info(f"Schema detected for {self.xml_path}: tei (based on listBibl and teiHeader)")
+            return 'tei'
+
+        # Wiley check for <bib xml:id> if it doesn't look like TEI or strong JATS
+        if self.soup.find('bib', attrs={'xml:id': True}):
+            if not self.soup.find('teiHeader') and not has_front_article_meta_journal_meta and not has_article_with_type:
+                logging.info(f"Schema detected for {self.xml_path}: wiley (based on bib xml:id and not strong TEI/JATS markers)")
+                return 'wiley'
+
+        # Fallback for less specific JATS-like (could be simple JATS or JATS-like Wiley)
+        if has_ref_list and self.soup.find('ref'):
+            if ref_list_tag := self.soup.find('ref-list'): # Requires Python 3.8+ for walrus operator
+                first_ref_in_list = ref_list_tag.find('ref')
+                if first_ref_in_list and first_ref_in_list.find('citation'): # Check for Wiley's common <citation> tag
+                    logging.info(f"Schema detected for {self.xml_path}: wiley (JATS-like ref-list with <citation> inside <ref>)")
+                    return 'wiley'
+            logging.info(f"Schema detected for {self.xml_path}: jats (fallback due to ref-list, less specific)")
+            return 'jats'
+
+        logging.warning(f"XML schema not confidently detected for {self.xml_path} using tag heuristics. Defaulting to 'unknown'.")
+        return 'unknown'
 
     def _parse_bib_jats(self) -> dict:
         """Strategy 1: Attempts to parse the bibliography using the JATS schema."""
@@ -185,6 +214,65 @@ class XMLParser:
                 if raw_ref_text:
                     bibliography_map[ref_id] = re.sub(r'\s+', ' ', raw_ref_text).strip()
         return bibliography_map
+
+    def get_bibliography_map(self) -> dict:
+        """
+        Master method to get the bibliography map. It tries multiple strategies
+        and caches the result to avoid re-parsing.
+        """
+        if not self.soup:
+            return {}
+        if self._bib_map is not None:
+            # If map is already cached, format_used should also be cached implicitly (or we could re-set it)
+            # For simplicity, we assume if _bib_map is set, bibliography_format_used was set correctly before.
+            return self._bib_map
+
+        # Schema type is now determined in self.schema_type (from __init__)
+        bib_map = {}
+        current_schema_for_bib = self.schema_type # Use detected schema first
+
+        if current_schema_for_bib == "jats":
+            bib_map = self._parse_bib_jats()
+        elif current_schema_for_bib == "tei":
+            bib_map = self._parse_bib_tei()
+        elif current_schema_for_bib == "wiley":
+            bib_map = self._parse_bib_wiley()
+        elif current_schema_for_bib == "bioc":
+            bib_map = self._parse_bib_bioc()
+
+        # If primary schema detection yielded no bib_map, or if schema was 'unknown',
+        # try the sequential parsing strategy as a robust fallback.
+        if not bib_map:
+            if self.schema_type not in ["jats", "tei", "wiley", "bioc"] : # only log if schema was initially unknown
+                 logging.info(f"Schema for {self.xml_path} was '{self.schema_type}'. Attempting sequential bib parsing for bibliography.")
+
+            # Try JATS strategy first if not already tried or failed
+            if current_schema_for_bib != "jats":
+                bib_map = self._parse_bib_jats()
+                if bib_map: current_schema_for_bib = "jats" # Update if this worked
+
+            # Fallback to TEI strategy
+            if not bib_map and current_schema_for_bib != "tei":
+                bib_map = self._parse_bib_tei()
+                if bib_map: current_schema_for_bib = "tei"
+
+            # Fallback to Wiley strategy
+            if not bib_map and current_schema_for_bib != "wiley":
+                bib_map = self._parse_bib_wiley()
+                if bib_map: current_schema_for_bib = "wiley"
+
+            # Fallback to BioC strategy
+            if not bib_map and current_schema_for_bib != "bioc":
+                bib_map = self._parse_bib_bioc()
+                if bib_map: current_schema_for_bib = "bioc"
+
+        self._bib_map = bib_map # Cache the result
+        # Set bibliography_format_used based on what actually succeeded or was primary.
+        self.bibliography_format_used = current_schema_for_bib if bib_map else self.schema_type
+        if not bib_map:
+            logging.warning(f"No bibliography map extracted for {self.xml_path} even after fallbacks. Detected schema: {self.schema_type}, Bib parsing attempt order result: {self.bibliography_format_used}")
+
+        return self._bib_map
 
     def _parse_bib_wiley(self) -> dict:
         """Strategy 3: Attempts to parse the bibliography using a Wiley XML schema."""
@@ -343,15 +431,19 @@ class XMLParser:
             return ""
         
         text = ""
-        if self.bibliography_format_used == "jats":
+        # Dispatch based on self.schema_type detected in __init__
+        if self.schema_type == "jats":
             text = self._get_full_text_jats()
-        elif self.bibliography_format_used == "tei":
+        elif self.schema_type == "tei":
             text = self._get_full_text_tei()
-        elif self.bibliography_format_used == "wiley":
+        elif self.schema_type == "wiley":
             text = self._get_full_text_wiley()
-        elif self.bibliography_format_used == "bioc":
+        elif self.schema_type == "bioc":
             text = self._get_full_text_bioc()
-        else:
+        elif self.schema_type == "unknown_or_error" and not self.soup: # Handle case where soup is None
+            return ""
+        else: # Default for "unknown" or if specific parser failed to produce text (though they shouldn't return None)
+            logging.info(f"get_full_text: Using fallback text extraction for schema '{self.schema_type}' on file {self.xml_path}")
             # Fallback for unknown or undetermined format
             if self.soup:
                 # Basic fallback: try to remove common bibliography sections by tag name
@@ -474,18 +566,21 @@ class XMLParser:
         This method is schema-aware.
         """
         if not self.soup:
-            return {}
+            return [] # Return empty list for consistency with new return type
 
-        if self.bibliography_format_used == "jats":
+        # Dispatch based on self.schema_type detected in __init__
+        if self.schema_type == "jats":
             return self._get_pointers_jats()
-        elif self.bibliography_format_used == "tei":
+        elif self.schema_type == "tei":
             return self._get_pointers_tei()
-        elif self.bibliography_format_used == "wiley":
+        elif self.schema_type == "wiley":
             return self._get_pointers_wiley()
-        elif self.bibliography_format_used == "bioc":
+        elif self.schema_type == "bioc":
             return self._get_pointers_bioc()
-        else:
-            # Fallback for unknown or undetermined format - use the old generic logic
+        elif self.schema_type == "unknown_or_error" and not self.soup:
+            return []
+        else: # Default for "unknown"
+            logging.info(f"get_pointer_map: Using generic pointer extraction for schema '{self.schema_type}' on file {self.xml_path}")
             return self._get_pointers_generic()
 
     def _get_pointers_generic(self) -> list[dict]: # Return type changed
