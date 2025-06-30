@@ -1,0 +1,12 @@
+<article>
+    <body>
+        <p>This is a JATS article. Here is a direct DOI: 10.1234/jats.example. And a pointer <xref ref-type="bibr" rid="r1">[1]</xref>.</p>
+    </body>
+    <back>
+        <ref-list>
+            <ref id="r1">
+                <mixed-citation>Reference 1. Another DOI: 10.5678/ref.jats.</mixed-citation>
+            </ref>
+        </ref-list>
+    </back>
+</article>
