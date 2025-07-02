@@ -1,5 +1,6 @@
 import re
 from bs4 import BeautifulSoup, Doctype
+import bs4 # Added for bs4.element.Tag
 import os
 from pprint import pprint
 from tqdm import tqdm # Should be used by the calling script if looping, not by parser itself
@@ -497,7 +498,7 @@ class XMLParser:
             if root_xmlns == wiley_ns:
                  logger.info(f"Schema detected for {self.xml_path}: wiley (root element with Wiley namespace)")
                  return 'wiley'
-            if self.soup.find(lambda tag: tag.name and tag.name.lower() == 'component' and tag.get('xmlns', '').lower() == wiley_ns):
+            if self.soup.find(lambda tag: isinstance(tag, bs4.element.Tag) and tag.name and tag.name.lower() == 'component' and tag.get('xmlns', '').lower() == wiley_ns):
                 logger.info(f"Schema detected for {self.xml_path}: wiley (<component> with Wiley namespace)")
                 return 'wiley'
 
